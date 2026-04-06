@@ -25,6 +25,7 @@ bytemuck = { version = "1", features = ["derive"] }
 hound = "3"
 chrono = "0.4"
 dirs-next = "2"
+thiserror = "2"
 
 [lints.rust]
 unsafe_code = "forbid"

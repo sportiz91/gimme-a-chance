@@ -1,8 +1,8 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicholasrice/tauri-schema/main/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "gimme-a-chance",
   "version": "0.1.0",
-  "identifier": "com.gimme-a-chance.app",
+  "identifier": "com.gimmeachance.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -11,8 +11,13 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost",
+      "freezePrototype": true
+    },
     "windows": [
       {
+        "label": "main",
         "title": "gimme-a-chance",
         "width": 480,
         "height": 720,
@@ -22,6 +27,14 @@
         "alwaysOnTop": true,
         "contentProtected": true
       }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
     ]
   }
 }

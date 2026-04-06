@@ -1,5 +1,6 @@
 mod audio;
 mod claude;
+mod error;
 mod transcriber;
 
 use std::sync::{Arc, Mutex};
