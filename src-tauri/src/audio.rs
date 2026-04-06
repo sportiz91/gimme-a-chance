@@ -1,6 +1,15 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless
+)]
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{HeapRb, traits::{Consumer, Producer, Split}};
+use ringbuf::{
+    traits::{Consumer, Producer, Split},
+    HeapRb,
+};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
@@ -41,12 +50,12 @@ pub fn list_input_devices() -> Result<Vec<DeviceInfo>> {
     Ok(devices)
 }
 
-/// Resample from source_rate to 16kHz mono f32
+/// Resample from `source_rate` to 16kHz mono f32
 fn resample_to_16k(samples: &[f32], source_rate: u32) -> Vec<f32> {
     if source_rate == WHISPER_SAMPLE_RATE {
         return samples.to_vec();
     }
-    let ratio = source_rate as f64 / WHISPER_SAMPLE_RATE as f64;
+    let ratio = f64::from(source_rate) / f64::from(WHISPER_SAMPLE_RATE);
     let output_len = (samples.len() as f64 / ratio) as usize;
     let mut output = Vec::with_capacity(output_len);
     for i in 0..output_len {
@@ -54,9 +63,9 @@ fn resample_to_16k(samples: &[f32], source_rate: u32) -> Vec<f32> {
         let idx = src_idx as usize;
         let frac = src_idx - idx as f64;
         let sample = if idx + 1 < samples.len() {
-            samples[idx] as f64 * (1.0 - frac) + samples[idx + 1] as f64 * frac
+            f64::from(samples[idx]) * (1.0 - frac) + f64::from(samples[idx + 1]) * frac
         } else if idx < samples.len() {
-            samples[idx] as f64
+            f64::from(samples[idx])
         } else {
             0.0
         };
@@ -72,7 +81,7 @@ fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     }
     samples
         .chunks(channels as usize)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .map(|frame| frame.iter().sum::<f32>() / f32::from(channels))
         .collect()
 }
 
@@ -87,7 +96,7 @@ pub async fn capture_and_transcribe(
     let device = if let Some(name) = device_name {
         host.input_devices()?
             .find(|d| d.name().map(|n| n == name).unwrap_or(false))
-            .context(format!("Device '{}' not found", name))?
+            .context(format!("Device '{name}' not found"))?
     } else {
         host.default_input_device()
             .context("No default input device")?
@@ -118,7 +127,7 @@ pub async fn capture_and_transcribe(
                 let _ = producer.try_push(sample);
             }
         },
-        |err| eprintln!("Audio stream error: {}", err),
+        |err| eprintln!("Audio stream error: {err}"),
         None,
     )?;
 
@@ -134,7 +143,10 @@ pub async fn capture_and_transcribe(
 
     loop {
         // Check if we should stop
-        if !*is_listening.lock().unwrap_or_else(|e| e.into_inner()) {
+        if !*is_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             break;
         }
 
@@ -167,7 +179,7 @@ pub async fn capture_and_transcribe(
                     app.emit("transcription", text.trim()).ok();
                 }
                 Ok(_) => {} // empty transcription, skip
-                Err(e) => eprintln!("Transcription error: {}", e),
+                Err(e) => eprintln!("Transcription error: {e}"),
             }
         }
 

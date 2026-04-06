@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    gimme_a_chance_lib::run()
+    gimme_a_chance_lib::run();
 }

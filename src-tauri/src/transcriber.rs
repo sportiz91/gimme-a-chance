@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::fmt::Write;
 use std::path::PathBuf;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -32,7 +33,10 @@ impl WhisperTranscriber {
 
     /// Transcribe a chunk of 16kHz mono f32 audio
     pub fn transcribe(&self, audio: &[f32]) -> Result<String> {
-        let mut state = self.ctx.create_state().context("Failed to create whisper state")?;
+        let mut state = self
+            .ctx
+            .create_state()
+            .context("Failed to create whisper state")?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("en"));
@@ -48,17 +52,11 @@ impl WhisperTranscriber {
 
         state
             .full(params, audio)
-            .map_err(|e| anyhow::anyhow!("Whisper inference failed: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Whisper inference failed: {e:?}"))?;
 
         let mut text = String::new();
-        let n_segments = state
-            .full_n_segments()
-            .map_err(|e| anyhow::anyhow!("Failed to get segments: {:?}", e))?;
-
-        for i in 0..n_segments {
-            if let Ok(segment) = state.full_get_segment_text(i) {
-                text.push_str(&segment);
-            }
+        for segment in state.as_iter() {
+            let _ = write!(text, "{segment}");
         }
 
         Ok(text)

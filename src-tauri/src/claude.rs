@@ -9,13 +9,12 @@ pub async fn ask(question: &str, context: &str) -> Result<String> {
         format!(
             "Interview context (recent transcription):\n\
              ---\n\
-             {}\n\
+             {context}\n\
              ---\n\n\
-             The interviewer just asked: \"{}\"\n\n\
+             The interviewer just asked: \"{question}\"\n\n\
              Give a concise, direct answer I can say out loud. \
              Keep it under 4 sentences unless it's a coding question. \
-             If it's a coding question, include the code but explain the approach first in 1-2 sentences.",
-            context, question
+             If it's a coding question, include the code but explain the approach first in 1-2 sentences."
         )
     };
 
@@ -29,7 +28,7 @@ pub async fn ask(question: &str, context: &str) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Claude CLI failed: {}", stderr);
+        anyhow::bail!("Claude CLI failed: {stderr}");
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();

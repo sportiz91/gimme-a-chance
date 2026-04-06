@@ -46,7 +46,7 @@ async fn start_listening(
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             if let Err(e) = audio::capture_and_transcribe(app, is_listening, device_name).await {
-                eprintln!("Audio pipeline error: {}", e);
+                eprintln!("Audio pipeline error: {e}");
             }
         });
     });
@@ -63,7 +63,9 @@ async fn stop_listening(state: tauri::State<'_, AppState>) -> Result<(), String>
 
 #[tauri::command]
 async fn ask_claude(question: String, context: String) -> Result<String, String> {
-    claude::ask(&question, &context).await.map_err(|e| e.to_string())
+    claude::ask(&question, &context)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
