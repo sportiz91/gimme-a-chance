@@ -1,0 +1,21 @@
+# Rust
+/src-tauri/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+package-lock.json
+
+# Whisper models
+*.bin
+
+# Tauri generated schemas
+/src-tauri/gen/schemas/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

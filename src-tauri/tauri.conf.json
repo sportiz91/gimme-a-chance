@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicholasrice/tauri-schema/main/schema.json",
+  "productName": "gimme-a-chance",
+  "version": "0.1.0",
+  "identifier": "com.gimme-a-chance.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "gimme-a-chance",
+        "width": 480,
+        "height": 720,
+        "resizable": true,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "contentProtected": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gimme-a-chance</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: rgba(15, 15, 15, 0.85);
+      color: #e0e0e0;
+      min-height: 100vh;
+      overflow-y: auto;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* Draggable title bar */
+    .titlebar {
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      background: rgba(30, 30, 30, 0.95);
+      cursor: grab;
+    }
+    .titlebar:active { cursor: grabbing; }
+    .titlebar span { font-size: 11px; opacity: 0.5; }
+
+    .container {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* Controls */
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button {
+      padding: 6px 14px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.08);
+      color: #e0e0e0;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: rgba(255,255,255,0.15); }
+    button.active {
+      background: rgba(76, 175, 80, 0.3);
+      border-color: rgba(76, 175, 80, 0.5);
+    }
+
+    select {
+      flex: 1;
+      padding: 6px 8px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.08);
+      color: #e0e0e0;
+      font-size: 12px;
+    }
+
+    /* Status indicator */
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      opacity: 0.6;
+    }
+    .status .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #666;
+    }
+    .status .dot.live {
+      background: #4caf50;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* Transcript area */
+    .section-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      opacity: 0.4;
+      margin-top: 4px;
+    }
+
+    #transcript {
+      max-height: 180px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 8px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    #transcript:empty::after {
+      content: 'Waiting for audio...';
+      opacity: 0.3;
+      font-style: italic;
+    }
+
+    /* Claude response area */
+    #response {
+      min-height: 100px;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.6;
+      padding: 10px;
+      background: rgba(33, 150, 243, 0.08);
+      border-radius: 6px;
+      border: 1px solid rgba(33, 150, 243, 0.2);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    #response:empty::after {
+      content: 'Claude response will appear here...';
+      opacity: 0.3;
+      font-style: italic;
+    }
+    #response.loading::after {
+      content: 'Thinking...';
+      opacity: 0.5;
+      animation: pulse 1s infinite;
+    }
+
+    /* Manual ask input */
+    .ask-row {
+      display: flex;
+      gap: 6px;
+    }
+    .ask-row input {
+      flex: 1;
+      padding: 6px 10px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.08);
+      color: #e0e0e0;
+      font-size: 13px;
+      outline: none;
+    }
+    .ask-row input:focus {
+      border-color: rgba(33, 150, 243, 0.5);
+    }
+  </style>
+</head>
+<body>
+  <div class="titlebar" data-tauri-drag-region>
+    <span>gimme-a-chance</span>
+    <div class="status">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Idle</span>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="controls">
+      <select id="deviceSelect"></select>
+      <button id="listenBtn" onclick="toggleListening()">Listen</button>
+    </div>
+
+    <div class="section-label">Transcript</div>
+    <div id="transcript"></div>
+
+    <div class="section-label">Claude</div>
+    <div id="response"></div>
+
+    <div class="ask-row">
+      <input id="askInput" type="text" placeholder="Ask Claude manually..." onkeydown="if(event.key==='Enter')askClaude()" />
+      <button onclick="askClaude()">Ask</button>
+    </div>
+  </div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
+
+    let isListening = false;
+    let transcriptLines = [];
+    const MAX_TRANSCRIPT_LINES = 20;
+
+    // Load audio devices
+    async function loadDevices() {
+      try {
+        const devices = await invoke('list_audio_devices');
+        const select = document.getElementById('deviceSelect');
+        select.innerHTML = '';
+        devices.forEach(d => {
+          const opt = document.createElement('option');
+          opt.value = d.name;
+          opt.textContent = d.name + (d.is_default ? ' (default)' : '');
+          if (d.is_default) opt.selected = true;
+          select.appendChild(opt);
+        });
+      } catch (e) {
+        console.error('Failed to list devices:', e);
+      }
+    }
+
+    async function toggleListening() {
+      const btn = document.getElementById('listenBtn');
+      const dot = document.getElementById('statusDot');
+      const status = document.getElementById('statusText');
+
+      if (!isListening) {
+        const device = document.getElementById('deviceSelect').value;
+        try {
+          await invoke('start_listening', { deviceName: device || null });
+          isListening = true;
+          btn.textContent = 'Stop';
+          btn.classList.add('active');
+          dot.classList.add('live');
+          status.textContent = 'Listening...';
+        } catch (e) {
+          console.error('Start failed:', e);
+        }
+      } else {
+        try {
+          await invoke('stop_listening');
+          isListening = false;
+          btn.textContent = 'Listen';
+          btn.classList.remove('active');
+          dot.classList.remove('live');
+          status.textContent = 'Idle';
+        } catch (e) {
+          console.error('Stop failed:', e);
+        }
+      }
+    }
+
+    async function askClaude(question) {
+      const input = document.getElementById('askInput');
+      const q = question || input.value.trim();
+      if (!q) return;
+
+      const responseEl = document.getElementById('response');
+      responseEl.textContent = '';
+      responseEl.classList.add('loading');
+      input.value = '';
+
+      try {
+        const context = transcriptLines.join('\n');
+        const answer = await invoke('ask_claude', { question: q, context });
+        responseEl.classList.remove('loading');
+        responseEl.textContent = answer;
+      } catch (e) {
+        responseEl.classList.remove('loading');
+        responseEl.textContent = 'Error: ' + e;
+      }
+    }
+
+    // Listen for transcription events from backend
+    listen('transcription', (event) => {
+      const text = event.payload;
+      transcriptLines.push(text);
+      if (transcriptLines.length > MAX_TRANSCRIPT_LINES) {
+        transcriptLines.shift();
+      }
+
+      const el = document.getElementById('transcript');
+      el.textContent = transcriptLines.join('\n');
+      el.scrollTop = el.scrollHeight;
+
+      // Auto-ask Claude when we detect a question
+      if (looksLikeQuestion(text)) {
+        askClaude(text);
+      }
+    });
+
+    function looksLikeQuestion(text) {
+      const t = text.trim().toLowerCase();
+      const questionStarters = [
+        'what ', 'how ', 'why ', 'can you', 'could you', 'tell me',
+        'explain', 'describe', 'what\'s', 'where ', 'when ', 'which ',
+        'have you', 'do you', 'did you', 'would you',
+      ];
+      return (
+        t.endsWith('?') ||
+        questionStarters.some(s => t.startsWith(s))
+      );
+    }
+
+    // Init
+    loadDevices();
+  </script>
+</body>
+</html>
