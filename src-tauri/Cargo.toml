@@ -20,7 +20,7 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 cpal = "0.15"
 ringbuf = "0.4"
-whisper-rs = "0.14"
+whisper-rs = "0.16"
 bytemuck = { version = "1", features = ["derive"] }
 hound = "3"
 chrono = "0.4"
