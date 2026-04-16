@@ -5,6 +5,7 @@ pub enum AppError {
     #[error("Audio error: {0}")]
     Audio(String),
 
+    #[allow(dead_code)]
     #[error("Transcription error: {0}")]
     Transcription(String),
 

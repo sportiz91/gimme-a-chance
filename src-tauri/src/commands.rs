@@ -16,20 +16,26 @@ pub async fn start_listening(
     app: tauri::AppHandle,
     device_name: Option<String>,
 ) -> Result<(), AppError> {
-    let mut is_listening = state
-        .is_listening
-        .lock()
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    if *is_listening {
-        return Err(AppError::Audio("Already listening".into()));
+    {
+        let mut is_listening = state
+            .is_listening
+            .lock()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        if *is_listening {
+            return Err(AppError::Audio("Already listening".into()));
+        }
+        *is_listening = true;
     }
-    *is_listening = true;
-    drop(is_listening);
 
     let is_listening = Arc::clone(&state.is_listening);
 
+    // Spawn a dedicated OS thread because cpal::Stream is not Send.
+    // Inside, we create a single-threaded tokio runtime to await the audio pipeline.
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
         rt.block_on(async {
             if let Err(e) = audio::capture_and_transcribe(app, is_listening, device_name).await {
                 eprintln!("Audio pipeline error: {e}");

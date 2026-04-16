@@ -18,6 +18,7 @@ use crate::transcriber;
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const CHUNK_DURATION_SECS: f32 = 5.0;
+#[allow(dead_code)]
 const CHUNK_SAMPLES: usize = (WHISPER_SAMPLE_RATE as f32 * CHUNK_DURATION_SECS) as usize;
 // Ring buffer: 30 seconds of audio
 const RING_BUFFER_SIZE: usize = WHISPER_SAMPLE_RATE as usize * 30;
@@ -28,6 +29,7 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub fn list_input_devices() -> Result<Vec<DeviceInfo>> {
     let host = cpal::default_host();
     let default_device = host.default_input_device();
