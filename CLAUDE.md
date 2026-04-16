@@ -23,7 +23,7 @@ cargo build
 
 1. `cargo fmt --all` — format code
 2. `cargo clippy --all-targets -- -D warnings` — zero warnings policy
-3. Or run: `powershell.exe -ExecutionPolicy Bypass -File "C:\Users\SANTI\Desktop\webdev\scripts\lint-gimme.ps1"`
+3. Or run: `.\scripts\lint.ps1` (see `scripts/README.md` for all helpers)
 
 ## Code Style
 
