@@ -19,3 +19,16 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Secrets / auth (defensive — nothing here today, keep it that way)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.keystore
+secrets/
+**/credentials.json
