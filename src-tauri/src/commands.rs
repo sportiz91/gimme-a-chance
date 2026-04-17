@@ -1,3 +1,8 @@
+// The `#[tauri::command]` macro expands into code that binds the returned
+// `Result<(), _>` with `let _ = ...`, which trips `let_underscore_must_use`.
+// The ignore is intentional on tauri's side (IPC ACK), so we allow it here.
+#![allow(clippy::let_underscore_must_use)]
+
 use std::sync::Arc;
 
 use crate::audio;

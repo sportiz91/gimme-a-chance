@@ -26,6 +26,18 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,gimme_a_chance_lib=debug".into()),
+        )
+        .init();
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "gimme-a-chance starting"
+    );
+
     let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
 
     tauri::Builder::default()
@@ -35,11 +47,19 @@ pub fn run() {
                 .with_handler(move |app, shortcut, event| {
                     if shortcut == &toggle_shortcut && event.state() == ShortcutState::Pressed {
                         if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
+                            let is_visible = window.is_visible().unwrap_or(false);
+                            tracing::debug!(
+                                was_visible = is_visible,
+                                action = if is_visible { "hide" } else { "show" },
+                                "toggle triggered"
+                            );
+                            let result = if is_visible {
+                                window.hide()
                             } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                window.show().and_then(|()| window.set_focus())
+                            };
+                            if let Err(e) = result {
+                                tracing::warn!(error = %e, "window toggle failed");
                             }
                         }
                     }
@@ -48,6 +68,7 @@ pub fn run() {
         )
         .setup(move |app| {
             app.global_shortcut().register(toggle_shortcut)?;
+            tracing::info!(shortcut = "Ctrl+Shift+Space", "global shortcut registered");
             Ok(())
         })
         .manage(AppState::default())

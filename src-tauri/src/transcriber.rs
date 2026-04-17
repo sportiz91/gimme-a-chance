@@ -56,7 +56,7 @@ impl WhisperTranscriber {
 
         let mut text = String::new();
         for segment in state.as_iter() {
-            let _ = write!(text, "{segment}");
+            write!(text, "{segment}").expect("writing to String is infallible");
         }
 
         Ok(text)

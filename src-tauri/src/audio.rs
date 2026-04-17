@@ -126,7 +126,7 @@ pub async fn capture_and_transcribe(
             // Convert to mono in the callback (fast, no allocations for small frames)
             let mono = to_mono(data, channels);
             for &sample in &mono {
-                let _ = producer.try_push(sample);
+                _ = producer.try_push(sample);
             }
         },
         |err| eprintln!("Audio stream error: {err}"),

@@ -27,5 +27,10 @@ if ((Test-Path $cargoBin) -and ($env:PATH -notlike "*$cargoBin*")) {
 
 Set-Location $RepoRoot
 
-Write-Host "Starting cargo tauri dev..." -ForegroundColor Cyan
+# Default log level. Override by setting $env:RUST_LOG in your shell first.
+if (-not $env:RUST_LOG) {
+    $env:RUST_LOG = "info,gimme_a_chance_lib=debug"
+}
+
+Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG)..." -ForegroundColor Cyan
 cargo tauri dev
