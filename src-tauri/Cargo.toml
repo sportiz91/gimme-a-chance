@@ -28,10 +28,41 @@ chrono = "0.4"
 dirs-next = "2"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+tracing-flame = { version = "0.2", optional = true }
+tracing-tracy = { version = "0.11", optional = true }
+assert_no_alloc = "1"
+hdrhistogram = "7"
+uuid = { version = "1", features = ["v4", "serde"] }
+webrtc-vad = "0.4"
+dhat = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[features]
+flame = ["dep:tracing-flame"]
+tracy = ["dep:tracing-tracy"]
+# DIY heap profiler: wraps the system allocator and counts bytes allocated/freed,
+# plus a 16-bucket logarithmic histogram of alloc sizes and peak-live tracking.
+# Mutually exclusive with the default `assert_no_alloc` guard (only one
+# `#[global_allocator]` allowed). Activate with: cargo build --features counting-alloc
+counting-alloc = []
+# Swap the inner allocator wrapped by `CountingAllocator` from `std::alloc::System`
+# (HeapAlloc on Windows) to mimalloc. Works WITH `counting-alloc` — the histogram
+# still tracks, just underneath a different allocator. Use both to A/B compare.
+# Without `counting-alloc`, `mimalloc` alone just replaces the global allocator.
+# Activate with: cargo build --features "counting-alloc mimalloc"
+mimalloc = ["dep:mimalloc"]
+# Full heap profiler with per-allocation call stacks. Writes logs/dhat-heap.json
+# on app exit; view at https://nnethercote.github.io/dh_view/dh_view.html
+# Mutually exclusive with `counting-alloc` and `assert_no_alloc`.
+# Activate with: cargo build --features dhat-heap
+dhat-heap = ["dep:dhat"]
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny` instead of `forbid` so modules that legitimately need it (like the
+# allocator implementation) can opt in with `#![allow(unsafe_code)]`.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

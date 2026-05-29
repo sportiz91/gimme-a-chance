@@ -1,8 +1,16 @@
 # dev.ps1 — Run gimme-a-chance in live dev mode (cargo tauri dev)
 #
 # Usage:
-#   .\scripts\dev.ps1
-#   powershell.exe -ExecutionPolicy Bypass -File scripts\dev.ps1
+#   .\scripts\dev.ps1                           (no features)
+#   .\scripts\dev.ps1 -Features tracy           (Tracy profiler)
+#   .\scripts\dev.ps1 -Features flame           (flamegraph folded output)
+#   .\scripts\dev.ps1 -Features tracy,flame     (both at once)
+#   powershell.exe -ExecutionPolicy Bypass -File scripts\dev.ps1 -Features tracy
+
+[CmdletBinding()]
+param(
+    [string]$Features
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -32,5 +40,10 @@ if (-not $env:RUST_LOG) {
     $env:RUST_LOG = "info,gimme_a_chance_lib=debug"
 }
 
-Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG)..." -ForegroundColor Cyan
-cargo tauri dev
+if ($Features) {
+    Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG, features=$Features)..." -ForegroundColor Cyan
+    cargo tauri dev --features $Features
+} else {
+    Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG)..." -ForegroundColor Cyan
+    cargo tauri dev
+}

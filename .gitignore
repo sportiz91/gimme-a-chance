@@ -16,9 +16,15 @@ package-lock.json
 .DS_Store
 Thumbs.db
 
+# Telemetry / logs
+/logs/
+
 # IDE
 .vscode/
 .idea/
+
+# Personal notes (not for the repo)
+/hot-path.md
 
 # Secrets / auth (defensive — nothing here today, keep it that way)
 .env

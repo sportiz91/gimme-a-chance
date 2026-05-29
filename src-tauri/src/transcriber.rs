@@ -32,6 +32,7 @@ impl WhisperTranscriber {
     }
 
     /// Transcribe a chunk of 16kHz mono f32 audio
+    #[tracing::instrument(skip(self, audio), fields(samples = audio.len()))]
     pub fn transcribe(&self, audio: &[f32]) -> Result<String> {
         let mut state = self
             .ctx

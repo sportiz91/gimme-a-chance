@@ -161,6 +161,37 @@
     .ask-row input:focus {
       border-color: rgba(33, 150, 243, 0.5);
     }
+
+    /* Debug overlay panel — toggled with Ctrl+Shift+D */
+    .debug-panel {
+      position: fixed;
+      bottom: 8px;
+      left: 8px;
+      right: 8px;
+      padding: 8px 10px;
+      background: rgba(0, 0, 0, 0.75);
+      border: 1px solid rgba(100, 149, 237, 0.4);
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 10px;
+      line-height: 1.5;
+      color: #b5d3ff;
+      display: none;
+      z-index: 1000;
+    }
+    .debug-panel.visible { display: block; }
+    .debug-panel .row { display: flex; justify-content: space-between; }
+    .debug-panel .key { opacity: 0.6; }
+    .debug-panel .val { font-weight: 600; }
+    .debug-panel .warn { color: #ffb74d; }
+    .debug-panel .bad { color: #ef5350; }
+    .debug-panel .title {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      opacity: 0.5;
+      margin-bottom: 4px;
+    }
   </style>
 </head>
 <body>
@@ -190,13 +221,48 @@
     </div>
   </div>
 
+  <div class="debug-panel" id="debugPanel">
+    <div class="title">Debug · Ctrl+Shift+D</div>
+    <div class="row"><span class="key">callback p50</span><span class="val" id="dbgP50">—</span></div>
+    <div class="row"><span class="key">callback p95</span><span class="val" id="dbgP95">—</span></div>
+    <div class="row"><span class="key">callback p99</span><span class="val" id="dbgP99">—</span></div>
+    <div class="row"><span class="key">callback p99.9</span><span class="val" id="dbgP999">—</span></div>
+    <div class="row"><span class="key">callback samples</span><span class="val" id="dbgSamples">—</span></div>
+    <div class="row"><span class="key">last STT</span><span class="val" id="dbgStt">—</span></div>
+    <div class="row"><span class="key">last LLM spawn</span><span class="val" id="dbgLlmSpawn">—</span></div>
+    <div class="row"><span class="key">last LLM total</span><span class="val" id="dbgLlm">—</span></div>
+    <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
+    <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
+    <div class="row"><span class="key">heap peak</span><span class="val" id="dbgHeapPeak">—</span></div>
+    <div class="row"><span class="key">heap total alloc'd</span><span class="val" id="dbgHeapTotal">—</span></div>
+    <div class="row"><span class="key">allocator</span><span class="val" id="dbgAllocator">—</span></div>
+  </div>
+
   <script>
     const { invoke } = window.__TAURI__.core;
     const { listen } = window.__TAURI__.event;
 
     let isListening = false;
     let transcriptLines = [];
+    let lastTraceId = null;
+    let lastTraceStart = 0;
+    let lastE2eMs = 0;
     const MAX_TRANSCRIPT_LINES = 20;
+
+    // Fire-and-forget structured log to the backend so JS events land in the
+    // same JSONL file as Rust logs (unified trace timeline).
+    function log(level, event, extra = {}) {
+      const { trace_id, elapsed_ms, ...data } = extra;
+      invoke('log_from_frontend', {
+        entry: {
+          level,
+          event,
+          trace_id: trace_id ?? null,
+          elapsed_ms: elapsed_ms ?? null,
+          data: Object.keys(data).length ? data : null,
+        },
+      }).catch((e) => console.error('log_from_frontend failed:', e));
+    }
 
     // Load audio devices
     async function loadDevices() {
@@ -247,30 +313,50 @@
       }
     }
 
-    async function askClaude(question) {
+    async function askClaude(question, traceId) {
       const input = document.getElementById('askInput');
       const q = question || input.value.trim();
       if (!q) return;
+
+      // If the caller didn't pass a trace_id (manual ask), mint a new one so
+      // we still get an end-to-end thread in the logs.
+      const trace_id = traceId || crypto.randomUUID();
+      const t0 = performance.now();
 
       const responseEl = document.getElementById('response');
       responseEl.textContent = '';
       responseEl.classList.add('loading');
       input.value = '';
 
+      log('info', 'ask_start', { trace_id, manual: !traceId, question_len: q.length });
+
       try {
         const context = transcriptLines.join('\n');
-        const answer = await invoke('ask_claude', { question: q, context });
+        const answer = await invoke('ask_claude', { traceId: trace_id, question: q, context });
+        const elapsed_ms = Math.round(performance.now() - t0);
         responseEl.classList.remove('loading');
         responseEl.textContent = answer;
+        log('info', 'ask_complete', { trace_id, elapsed_ms, answer_len: answer.length });
+
+        // End-to-end: from transcription emit (backend) to painted answer (frontend).
+        if (trace_id === lastTraceId && lastTraceStart > 0) {
+          lastE2eMs = Math.round(performance.now() - lastTraceStart);
+          document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
+          log('info', 'e2e_complete', { trace_id, elapsed_ms: lastE2eMs });
+        }
       } catch (e) {
+        const elapsed_ms = Math.round(performance.now() - t0);
         responseEl.classList.remove('loading');
         responseEl.textContent = 'Error: ' + e;
+        log('error', 'ask_failed', { trace_id, elapsed_ms, error: String(e) });
       }
     }
 
     // Listen for transcription events from backend
     listen('transcription', (event) => {
-      const text = event.payload;
+      const { trace_id, text } = event.payload;
+      lastTraceId = trace_id;
+      lastTraceStart = performance.now();
       transcriptLines.push(text);
       if (transcriptLines.length > MAX_TRANSCRIPT_LINES) {
         transcriptLines.shift();
@@ -280,9 +366,12 @@
       el.textContent = transcriptLines.join('\n');
       el.scrollTop = el.scrollHeight;
 
+      log('info', 'transcription_received', { trace_id, text_len: text.length });
+
       // Auto-ask Claude when we detect a question
       if (looksLikeQuestion(text)) {
-        askClaude(text);
+        log('info', 'question_detected', { trace_id, heuristic: 'looksLikeQuestion' });
+        askClaude(text, trace_id);
       }
     });
 
@@ -298,6 +387,68 @@
         questionStarters.some(s => t.startsWith(s))
       );
     }
+
+    // --- Debug panel wiring ---
+    const debugPanel = document.getElementById('debugPanel');
+
+    // Threshold for coloring latency: <1ms green/normal, <5ms amber, >=5ms red.
+    function fmtUs(us) {
+      if (!us) return '—';
+      const ms = us / 1000;
+      if (ms >= 1) return ms.toFixed(2) + ' ms';
+      return us + ' µs';
+    }
+    function classifyUs(us, warnUs, badUs) {
+      if (!us) return '';
+      if (us >= badUs) return 'bad';
+      if (us >= warnUs) return 'warn';
+      return '';
+    }
+
+    function fmtBytes(n) {
+      if (!n) return '—';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+      return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    }
+
+    listen('metrics', (event) => {
+      const m = event.payload;
+      const setCell = (id, us, warnUs, badUs) => {
+        const el = document.getElementById(id);
+        el.textContent = fmtUs(us);
+        el.className = 'val ' + classifyUs(us, warnUs, badUs);
+      };
+      // Audio callback budget is ~10ms at typical buffer sizes — flag at 1ms/5ms.
+      setCell('dbgP50', m.callback_p50_us, 1000, 5000);
+      setCell('dbgP95', m.callback_p95_us, 1000, 5000);
+      setCell('dbgP99', m.callback_p99_us, 1000, 5000);
+      setCell('dbgP999', m.callback_p999_us, 1000, 5000);
+      document.getElementById('dbgSamples').textContent = m.callback_samples || '—';
+      document.getElementById('dbgStt').textContent = m.last_stt_ms ? m.last_stt_ms + ' ms' : '—';
+      document.getElementById('dbgLlmSpawn').textContent = m.last_llm_spawn_ms ? m.last_llm_spawn_ms + ' ms' : '—';
+      document.getElementById('dbgLlm').textContent = m.last_llm_ms ? m.last_llm_ms + ' ms' : '—';
+      if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
+
+      // Allocator label is always populated — it's compile-time constant.
+      document.getElementById('dbgAllocator').textContent = m.allocator_name || '—';
+
+      // Heap metrics only meaningful when compiled with the counting-alloc feature.
+      if (m.counting_alloc_enabled) {
+        document.getElementById('dbgHeapLive').textContent = fmtBytes(m.heap_live_bytes);
+        document.getElementById('dbgHeapPeak').textContent = fmtBytes(m.heap_peak_live_bytes);
+        document.getElementById('dbgHeapTotal').textContent = fmtBytes(m.heap_total_allocated_bytes);
+      } else {
+        document.getElementById('dbgHeapLive').textContent = '— (feature off)';
+        document.getElementById('dbgHeapPeak').textContent = '— (feature off)';
+        document.getElementById('dbgHeapTotal').textContent = '— (feature off)';
+      }
+    });
+
+    listen('toggle-debug-panel', () => {
+      debugPanel.classList.toggle('visible');
+    });
 
     // Init
     loadDevices();
