@@ -25,6 +25,7 @@ Thumbs.db
 
 # Personal notes (not for the repo)
 /hot-path.md
+/changes.log
 
 # Secrets / auth (defensive — nothing here today, keep it that way)
 .env
