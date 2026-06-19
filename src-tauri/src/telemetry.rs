@@ -42,7 +42,10 @@ pub fn logs_dir() -> PathBuf {
 pub fn init() -> TelemetryGuards {
     let logs = logs_dir();
     if let Err(e) = std::fs::create_dir_all(&logs) {
-        eprintln!("telemetry: could not create logs dir {}: {e}", logs.display());
+        eprintln!(
+            "telemetry: could not create logs dir {}: {e}",
+            logs.display()
+        );
     }
 
     let file_appender = RollingFileAppender::builder()

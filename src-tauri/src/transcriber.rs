@@ -5,6 +5,13 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 const MODEL_FILENAME: &str = "ggml-base.en.bin";
 
+/// Domain vocabulary primer for a software-engineering interview. Steers whisper
+/// toward correct spellings of jargon it otherwise garbles.
+const INITIAL_PROMPT: &str = "A technical software engineering interview. Topics include \
+Rust, tokio, async/await, Next.js, React, the DOM, TypeScript, Kubernetes, Docker, \
+PostgreSQL, Redis, gRPC, REST, GraphQL, WebSocket, OAuth, JWT, mutex, semaphore, \
+latency, throughput, rate limiter, and system design.";
+
 pub struct WhisperTranscriber {
     ctx: WhisperContext,
 }
@@ -41,7 +48,13 @@ impl WhisperTranscriber {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("en"));
-        params.set_n_threads(4);
+        // 6 threads on the i7-1165G7 (4 physical / 8 logical): whisper.cpp is
+        // compute-bound so gains taper past physical cores, but 6 edges out 4.
+        params.set_n_threads(6);
+        // Bias decoding toward the technical vocabulary that base.en mangles
+        // ("tokio"→"Tokyo", "the DOM"→"dumb", "Next.js"→"Next Shaiyes"). The prompt
+        // primes whisper's context so these spellings become likely.
+        params.set_initial_prompt(INITIAL_PROMPT);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);

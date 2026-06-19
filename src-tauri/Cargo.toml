@@ -19,6 +19,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
+# API mode: HTTP client (native-tls = schannel on Windows, no OpenSSL needed).
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+futures-util = "0.3"
+# Secrets: in-memory protection (SecretString) + at-rest OS keyring.
+secrecy = "0.8"
+keyring = { version = "3", features = ["windows-native"] }
+# Audio playback for the "simulate interviewer" self-test loop (decodes WAV, plays
+# to the default output device so loopback capture can pick it up).
+rodio = "0.20"
+# On-device STT (Parakeet offline + streaming Nemotron online) + Kokoro TTS via
+# the OFFICIAL k2-fsa Rust bindings, behind the `sherpa` feature. Downloads
+# prebuilt native libs from the sherpa-onnx releases. `shared` (DLLs) and not
+# `static`: the static prebuilts are /MT (static CRT, LIBCMT) and multiply-define
+# CRT symbols against our /MD whisper.cpp objects (LNK1169). Replaced the
+# deprecated/archived `sherpa-rs` crate, whose build script force-linked msvcrtd
+# into Windows debug builds (mixed-CRT aborts — see the repo CLAUDE.md).
+sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
 cpal = "0.15"
 ringbuf = "0.4"
 whisper-rs = "0.16"
@@ -42,6 +59,11 @@ mimalloc = { version = "0.1", optional = true, default-features = false }
 [features]
 flame = ["dep:tracing-flame"]
 tracy = ["dep:tracing-tracy"]
+# Local on-device models via sherpa-onnx: STT (Parakeet offline, Nemotron
+# streaming) and Kokoro TTS. Gated because it links native libs + needs models
+# downloaded. The default build stays pure-cloud (whisper-rs STT + OpenAI TTS).
+# Activate with: cargo build --features sherpa  (after scripts/fetch-models.ps1)
+sherpa = ["dep:sherpa-onnx"]
 # DIY heap profiler: wraps the system allocator and counts bytes allocated/freed,
 # plus a 16-bucket logarithmic histogram of alloc sizes and peak-live tracking.
 # Mutually exclusive with the default `assert_no_alloc` guard (only one

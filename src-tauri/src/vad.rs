@@ -20,9 +20,14 @@ pub const PRE_SPEECH_PAD_MS: usize = 300;
 /// Too short → cuts mid-sentence. Too long → feels laggy.
 pub const POST_SPEECH_PAD_MS: usize = 500;
 /// Minimum voiced duration to bother transcribing (filters out blips/clicks).
-pub const MIN_CHUNK_MS: usize = 300;
+/// Raised from 300ms: real interview utterances run longer, while most VAD
+/// false-positives (clicks, coughs, "um") are shorter — so this drops a lot of
+/// the `[BLANK_AUDIO]` garbage before it ever reaches whisper.
+pub const MIN_CHUNK_MS: usize = 700;
 /// Hard cap on chunk duration so one long sentence without pauses still flushes.
-pub const MAX_CHUNK_MS: usize = 15_000;
+/// Lowered 15s→8s: with fast cloud STT (Groq ~0.4s) shorter caps cut the worst-case
+/// lag during continuous speech without saturating the transcription step.
+pub const MAX_CHUNK_MS: usize = 8_000;
 
 const PRE_SPEECH_PAD_SAMPLES: usize = SAMPLE_RATE_HZ * PRE_SPEECH_PAD_MS / 1000;
 const POST_SPEECH_PAD_FRAMES: usize = POST_SPEECH_PAD_MS / FRAME_MS;

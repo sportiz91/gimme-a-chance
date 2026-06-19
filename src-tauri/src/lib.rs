@@ -1,17 +1,23 @@
 #[cfg(feature = "counting-alloc")]
 mod alloc_counter;
 mod audio;
+mod backend;
 mod claude;
+mod cloud_stt;
 mod commands;
 mod crashlog;
 mod error;
 mod latency;
 mod metrics;
+mod secrets;
+#[cfg(feature = "sherpa")]
+mod stt;
 mod telemetry;
 mod transcriber;
+mod tts;
 mod vad;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -74,6 +80,18 @@ pub struct AppState {
     pub is_listening: Arc<Mutex<bool>>,
     pub transcript: Arc<Mutex<String>>,
     pub metrics: Arc<metrics::Metrics>,
+    /// The persistent Claude session. Constructed in `setup` (needs the `AppHandle`),
+    /// so it starts empty and is filled once at startup.
+    pub claude: Arc<OnceLock<claude::ClaudeSession>>,
+    /// Direct-API backend (Groq → `OpenAI` fallback chain). Built at startup.
+    pub api: Arc<backend::ApiBackend>,
+    /// Which backend answers `ask_claude`. Toggled from the UI; default = API.
+    pub mode: Arc<Mutex<backend::Mode>>,
+    /// Text-to-speech engine for the "simulate interviewer" self-test.
+    pub tts: Arc<tts::TtsEngine>,
+    /// The local whisper model, loaded once and shared across Listen sessions and
+    /// (in dual mode) both capture pipelines — the offline STT fallback.
+    pub whisper: Arc<OnceLock<Arc<transcriber::WhisperTranscriber>>>,
 }
 
 impl Default for AppState {
@@ -82,10 +100,60 @@ impl Default for AppState {
             is_listening: Arc::new(Mutex::new(false)),
             transcript: Arc::new(Mutex::new(String::new())),
             metrics: Arc::new(metrics::Metrics::default()),
+            claude: Arc::new(OnceLock::new()),
+            api: Arc::new(backend::ApiBackend::new()),
+            mode: Arc::new(Mutex::new(backend::Mode::Api)),
+            tts: Arc::new(tts::TtsEngine::new()),
+            whisper: Arc::new(OnceLock::new()),
         }
     }
 }
 
+/// Boot the persistent Claude session at app startup (not lazily on the first
+/// question). Spawning the process alone isn't enough — the prompt cache is only
+/// written when we actually send a message — so we fire a discarded `warmup`
+/// immediately. Claude Code caches its (huge) system+tools prefix with a 1-HOUR
+/// ephemeral TTL that refreshes on each read, so a gentle heartbeat keeps it warm
+/// for an arbitrarily long interview. Real questions then always hit a warm cache.
+fn start_claude_session(app: &tauri::AppHandle, cell: &Arc<OnceLock<claude::ClaudeSession>>) {
+    let session = claude::ClaudeSession::spawn(app.clone());
+    _ = cell.set(session.clone());
+    tauri::async_runtime::spawn(async move {
+        match session.warmup().await {
+            Ok(o) => tracing::info!(
+                ttft_ms = o.ttft_ms,
+                total_ms = o.total_ms,
+                cache_creation_tokens = o.cache_creation_tokens,
+                "claude warmup complete (session ready)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "claude warmup failed"),
+        }
+
+        // Heartbeat: keep the 1-hour prompt cache warm. 30min < 60min TTL, and a
+        // cache read refreshes the TTL, so this keeps it alive indefinitely while
+        // barely touching the 5-hour subscription usage limit.
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await; // consume the immediate first tick (warmup already ran)
+        loop {
+            interval.tick().await;
+            match session.warmup().await {
+                Ok(o) => tracing::debug!(
+                    cache_read_tokens = o.cache_read_tokens,
+                    cache_creation_tokens = o.cache_creation_tokens,
+                    total_ms = o.total_ms,
+                    "claude heartbeat (cache_read>0 ⇒ cache stayed warm)"
+                ),
+                Err(e) => tracing::warn!(error = %e, "claude heartbeat failed"),
+            }
+        }
+    });
+}
+
+// `run` is a long-by-nature Tauri builder: shortcut registration, the async
+// metrics emitter (with a sizeable counting-alloc branch), and app wiring all
+// live here. Session startup was already extracted to `start_claude_session`.
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The guards must live for the whole program lifetime, otherwise the non-blocking
@@ -116,7 +184,8 @@ pub fn run() {
         "gimme-a-chance starting"
     );
 
-    let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+    // Ctrl+Shift+H toggles the overlay's visibility (same binding as screen-peek).
+    let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyH);
     let debug_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyD);
     // Graceful quit: Tauri's run loop returns cleanly, letting local guards like
     // the dhat profiler drop properly and write their output. Killing via Ctrl+C
@@ -125,6 +194,18 @@ pub fn run() {
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
+    let claude_cell = Arc::clone(&app_state.claude);
+    let whisper_cell = Arc::clone(&app_state.whisper);
+
+    // Preload the whisper model at startup (off the main thread) so the first
+    // "Listen" doesn't pay the ~140MB load, and so it's loaded only once.
+    std::thread::spawn(move || match transcriber::WhisperTranscriber::new() {
+        Ok(w) => {
+            _ = whisper_cell.set(Arc::new(w));
+            tracing::info!("whisper model preloaded at startup");
+        }
+        Err(e) => tracing::warn!(error = %e, "whisper preload failed (will retry on first Listen)"),
+    });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -174,11 +255,15 @@ pub fn run() {
             app.global_shortcut().register(debug_shortcut)?;
             app.global_shortcut().register(quit_shortcut)?;
             tracing::info!(
-                window_toggle = "Ctrl+Shift+Space",
+                window_toggle = "Ctrl+Shift+H",
                 debug_panel = "Ctrl+Shift+D",
                 quit = "Ctrl+Shift+Q",
                 "global shortcuts registered"
             );
+
+            // Boot the persistent Claude session NOW (app startup), not lazily on
+            // the first question — see `start_claude_session` for the why.
+            start_claude_session(app.handle(), &claude_cell);
 
             // Periodic metrics emitter: every 2s push a snapshot to the frontend
             // so the debug panel can refresh without polling. `setup` runs before
@@ -255,9 +340,13 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_devices,
+            commands::list_output_devices,
             commands::start_listening,
             commands::stop_listening,
             commands::ask_claude,
+            commands::set_mode,
+            commands::get_mode,
+            commands::simulate_interviewer,
             commands::log_from_frontend,
         ])
         .build(tauri::generate_context!())
