@@ -117,6 +117,10 @@
       opacity: 0.3;
       font-style: italic;
     }
+    .spk-int { color: #64b5f6; font-weight: 700; }
+    .spk-me  { color: #81c784; font-weight: 700; }
+    /* Live partial hypothesis from the streaming STT engine */
+    .partial { opacity: 0.55; font-style: italic; }
 
     /* Claude response area */
     #response {
@@ -205,8 +209,20 @@
 
   <div class="container">
     <div class="controls">
+      <select id="sourceSelect" onchange="loadDevices()" title="Capture source" style="flex:0 0 auto; max-width:170px">
+        <option value="mic">🎙️ Microphone</option>
+        <option value="loopback">🔊 System audio</option>
+        <option value="both">🎙️+🔊 Both (interviewer + you)</option>
+      </select>
       <select id="deviceSelect"></select>
+      <select id="modeSelect" onchange="setMode()" title="Answering backend" style="flex:0 0 auto; max-width:150px">
+        <option value="api">API (Groq→OpenAI)</option>
+        <option value="claude_code">Claude Code</option>
+      </select>
       <button id="listenBtn" onclick="toggleListening()">Listen</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Also answer questions YOU ask via the mic">
+        <input type="checkbox" id="answerMe"> answer me
+      </label>
     </div>
 
     <div class="section-label">Transcript</div>
@@ -218,6 +234,19 @@
     <div class="ask-row">
       <input id="askInput" type="text" placeholder="Ask Claude manually..." onkeydown="if(event.key==='Enter')askClaude()" />
       <button onclick="askClaude()">Ask</button>
+    </div>
+
+    <div class="section-label">Simulate interviewer (test)</div>
+    <div class="ask-row">
+      <select id="simPreset" onchange="document.getElementById('simInput').value=this.value" style="flex:0 0 auto; max-width:150px">
+        <option value="">Presets…</option>
+        <option value="What is a rate limiter, and when would you use one?">Factual</option>
+        <option value="How would you design a distributed rate limiter? Walk me through the trade-offs.">System design</option>
+        <option value="Write a function that reverses a linked list, and explain the approach.">Coding</option>
+        <option value="Tell me about a challenging project you worked on recently.">Behavioral</option>
+      </select>
+      <input id="simInput" type="text" placeholder="Interviewer question to speak aloud..." onkeydown="if(event.key==='Enter')simulateInterviewer()" />
+      <button onclick="simulateInterviewer()">🔊 Speak</button>
     </div>
   </div>
 
@@ -231,6 +260,11 @@
     <div class="row"><span class="key">last STT</span><span class="val" id="dbgStt">—</span></div>
     <div class="row"><span class="key">last LLM spawn</span><span class="val" id="dbgLlmSpawn">—</span></div>
     <div class="row"><span class="key">last LLM total</span><span class="val" id="dbgLlm">—</span></div>
+    <div class="row"><span class="key">last LLM TTFT</span><span class="val" id="dbgTtft">—</span></div>
+    <div class="row"><span class="key">cache read tok</span><span class="val" id="dbgCacheRead">—</span></div>
+    <div class="row"><span class="key">cache write tok</span><span class="val" id="dbgCacheWrite">—</span></div>
+    <div class="row"><span class="key">tool-use breaches</span><span class="val" id="dbgToolUse">—</span></div>
+    <div class="row"><span class="key">provider</span><span class="val" id="dbgProvider">—</span></div>
     <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
     <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
     <div class="row"><span class="key">heap peak</span><span class="val" id="dbgHeapPeak">—</span></div>
@@ -244,6 +278,12 @@
 
     let isListening = false;
     let transcriptLines = [];
+    // Streaming engine only: per-speaker partial hypothesis, rendered as a gray
+    // italic tail line that refines in place until the final replaces it.
+    const partialLines = { me: '', interviewer: '' };
+    let activeTraceId = null;   // the question currently being answered (for streaming)
+    let firstDeltaSeen = false; // whether the active answer has painted its first token
+    let lastAnsweredQ = '';     // normalized last question answered (dedup across the window)
     let lastTraceId = null;
     let lastTraceStart = 0;
     let lastE2eMs = 0;
@@ -264,11 +304,30 @@
       }).catch((e) => console.error('log_from_frontend failed:', e));
     }
 
+    // Escape user/transcribed text before inserting as HTML (label rendering).
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+
     // Load audio devices
     async function loadDevices() {
+      const source = document.getElementById('sourceSelect').value;
+      // Remember the choice across app relaunches — the dev loop restarts the
+      // window constantly and a silently-reset source means capturing from the
+      // wrong place (mic instead of system audio).
+      localStorage.setItem('captureSource', source);
+      const select = document.getElementById('deviceSelect');
+      if (source === 'both') {
+        select.innerHTML = '<option>default mic + default output</option>';
+        select.disabled = true;
+        return;
+      }
+      select.disabled = false;
+      const cmd = source === 'loopback' ? 'list_output_devices' : 'list_audio_devices';
       try {
-        const devices = await invoke('list_audio_devices');
-        const select = document.getElementById('deviceSelect');
+        const devices = await invoke(cmd);
         select.innerHTML = '';
         devices.forEach(d => {
           const opt = document.createElement('option');
@@ -282,6 +341,39 @@
       }
     }
 
+    async function simulateInterviewer() {
+      const input = document.getElementById('simInput');
+      const text = input.value.trim();
+      if (!text) return;
+      log('info', 'simulate_interviewer_start', { chars: text.length });
+      try {
+        const path = await invoke('simulate_interviewer', { text });
+        log('info', 'simulate_interviewer_done', { path });
+      } catch (e) {
+        console.error('simulate_interviewer failed:', e);
+        log('error', 'simulate_interviewer_failed', { error: String(e) });
+      }
+    }
+
+    async function setMode() {
+      const mode = document.getElementById('modeSelect').value;
+      try {
+        await invoke('set_mode', { mode });
+        log('info', 'mode_set', { mode });
+      } catch (e) {
+        console.error('set_mode failed:', e);
+      }
+    }
+
+    async function initMode() {
+      try {
+        const m = await invoke('get_mode');
+        document.getElementById('modeSelect').value = m;
+      } catch (e) {
+        console.error('get_mode failed:', e);
+      }
+    }
+
     async function toggleListening() {
       const btn = document.getElementById('listenBtn');
       const dot = document.getElementById('statusDot');
@@ -289,8 +381,9 @@
 
       if (!isListening) {
         const device = document.getElementById('deviceSelect').value;
+        const source = document.getElementById('sourceSelect').value;
         try {
-          await invoke('start_listening', { deviceName: device || null });
+          await invoke('start_listening', { deviceName: device || null, source });
           isListening = true;
           btn.textContent = 'Stop';
           btn.classList.add('active');
@@ -321,6 +414,8 @@
       // If the caller didn't pass a trace_id (manual ask), mint a new one so
       // we still get an end-to-end thread in the logs.
       const trace_id = traceId || crypto.randomUUID();
+      activeTraceId = trace_id;
+      firstDeltaSeen = false;
       const t0 = performance.now();
 
       const responseEl = document.getElementById('response');
@@ -331,7 +426,9 @@
       log('info', 'ask_start', { trace_id, manual: !traceId, question_len: q.length });
 
       try {
-        const context = transcriptLines.join('\n');
+        const context = transcriptLines
+          .map(l => (l.speaker === 'me' ? 'You' : 'Interviewer') + ': ' + l.text)
+          .join('\n');
         const answer = await invoke('ask_claude', { traceId: trace_id, question: q, context });
         const elapsed_ms = Math.round(performance.now() - t0);
         responseEl.classList.remove('loading');
@@ -352,40 +449,132 @@
       }
     }
 
-    // Listen for transcription events from backend
-    listen('transcription', (event) => {
+    // Stream Claude's answer token-by-token as it arrives from the backend.
+    // The final full answer still comes back from the `ask_claude` invoke (which
+    // reconciles `textContent`), but these deltas paint the first line in ~1s.
+    listen('answer-delta', (event) => {
       const { trace_id, text } = event.payload;
+      if (trace_id !== activeTraceId) return; // ignore stale deltas
+      const responseEl = document.getElementById('response');
+      responseEl.classList.remove('loading');
+      if (!firstDeltaSeen && trace_id === lastTraceId && lastTraceStart > 0) {
+        // First token = end-to-end "time to first word" for the debug panel.
+        log('info', 'ttft', { trace_id, elapsed_ms: Math.round(performance.now() - lastTraceStart) });
+      }
+      firstDeltaSeen = true;
+      responseEl.textContent += text;
+      responseEl.scrollTop = responseEl.scrollHeight;
+    });
+
+    // Listen for transcription events from backend. Each line is labeled with its
+    // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
+    function speakerLabel(who) {
+      return who === 'me'
+        ? '<span class="spk-me">You:</span>'
+        : '<span class="spk-int">Interviewer:</span>';
+    }
+
+    function renderTranscript() {
+      const lines = transcriptLines.map(l => speakerLabel(l.speaker) + ' ' + escapeHtml(l.text));
+      for (const who of ['interviewer', 'me']) {
+        if (partialLines[who]) {
+          lines.push('<span class="partial">' + speakerLabel(who) + ' ' + escapeHtml(partialLines[who]) + '</span>');
+        }
+      }
+      const el = document.getElementById('transcript');
+      el.innerHTML = lines.join('<br>');
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // Live partials from the streaming STT engine. The hypothesis refines in
+    // place while the speaker talks; the final arrives as a regular
+    // 'transcription' event (backend clears the partial with an empty text).
+    listen('transcription-partial', (event) => {
+      const { text, speaker } = event.payload;
+      const who = speaker === 'me' ? 'me' : 'interviewer';
+      partialLines[who] = text;
+      renderTranscript();
+    });
+
+    listen('transcription', (event) => {
+      const { trace_id, text, speaker } = event.payload;
+      const who = speaker === 'me' ? 'me' : 'interviewer';
       lastTraceId = trace_id;
       lastTraceStart = performance.now();
-      transcriptLines.push(text);
+      partialLines[who] = '';
+      transcriptLines.push({ speaker: who, text });
       if (transcriptLines.length > MAX_TRANSCRIPT_LINES) {
         transcriptLines.shift();
       }
+      renderTranscript();
 
-      const el = document.getElementById('transcript');
-      el.textContent = transcriptLines.join('\n');
-      el.scrollTop = el.scrollHeight;
+      log('info', 'transcription_received', { trace_id, speaker: who, text_len: text.length });
 
-      log('info', 'transcription_received', { trace_id, text_len: text.length });
+      // By default only the INTERVIEWER's speech triggers an answer; your own voice
+      // is context. The "answer me" toggle lets your mic questions be answered too.
+      const answerMe = document.getElementById('answerMe').checked;
+      if (who === 'me' && !answerMe) return;
 
-      // Auto-ask Claude when we detect a question
-      if (looksLikeQuestion(text)) {
-        log('info', 'question_detected', { trace_id, heuristic: 'looksLikeQuestion' });
-        askClaude(text, trace_id);
+      // Detect over a 2-chunk window of THIS speaker's lines so questions split
+      // across chunk boundaries are still caught. Dedup against the last answered.
+      const win = transcriptLines
+        .filter(l => l.speaker === who)
+        .slice(-2)
+        .map(l => l.text)
+        .join(' ');
+      const q = extractQuestion(win);
+      if (q) {
+        const norm = q.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (norm !== lastAnsweredQ) {
+          lastAnsweredQ = norm;
+          log('info', 'question_detected', { trace_id, question: q });
+          askClaude(q, trace_id);
+        }
       }
     });
 
-    function looksLikeQuestion(text) {
-      const t = text.trim().toLowerCase();
-      const questionStarters = [
-        'what ', 'how ', 'why ', 'can you', 'could you', 'tell me',
-        'explain', 'describe', 'what\'s', 'where ', 'when ', 'which ',
-        'have you', 'do you', 'did you', 'would you',
-      ];
-      return (
-        t.endsWith('?') ||
-        questionStarters.some(s => t.startsWith(s))
-      );
+    // Rhetorical / confirmatory fillers — mostly the candidate checking in, not
+    // interviewer questions worth answering.
+    function isRhetorical(s) {
+      const t = s.toLowerCase();
+      return [
+        'right?', 'ok?', 'okay?', 'correct?', 'got it?', 'alright?', 'all right?',
+        'yeah?', 'cool?', 'you know?', 'is that fine', 'does that make sense',
+        'make sense?', 'anything so far', 'sound good', 'sounds good',
+      ].some(r => t.includes(r));
+    }
+
+    const Q_STARTERS = [
+      'what ', 'how ', 'why ', 'can you', 'could you', 'tell me ', 'explain ',
+      'describe ', 'what\'s', 'where ', 'when ', 'which ', 'walk me through',
+      'how would', 'how do', 'what are', 'what would', 'design a', 'design the',
+      'would you ', 'do you ', 'have you ',
+    ];
+
+    // Extract a real question from a text window, or null. Handles a '?' anywhere
+    // (not just at the end) and pulls a clean lead-in so we send the LLM just the
+    // question — not the whole multi-sentence chunk.
+    function extractQuestion(text) {
+      const qi = text.lastIndexOf('?');
+      if (qi >= 0) {
+        // Lead-in: back to the previous sentence boundary, capped at 180 chars.
+        let start = Math.max(
+          text.lastIndexOf('.', qi - 1),
+          text.lastIndexOf('?', qi - 1),
+          text.lastIndexOf('!', qi - 1),
+        );
+        if (start < 0 || qi - start > 180) start = Math.max(-1, qi - 180);
+        const q = text.slice(start + 1, qi + 1).trim();
+        if (q.length >= 12 && !isRhetorical(q)) return q;
+      }
+      // No '?': accept a last sentence that starts like an interviewer question.
+      const sentences = text.split(/(?<=[.?!])\s+/).map(s => s.trim()).filter(Boolean);
+      const last = sentences[sentences.length - 1] || '';
+      if (last.length >= 12 && !isRhetorical(last) &&
+          Q_STARTERS.some(st => last.toLowerCase().startsWith(st))) {
+        return last;
+      }
+      return null;
     }
 
     // --- Debug panel wiring ---
@@ -429,6 +618,16 @@
       document.getElementById('dbgStt').textContent = m.last_stt_ms ? m.last_stt_ms + ' ms' : '—';
       document.getElementById('dbgLlmSpawn').textContent = m.last_llm_spawn_ms ? m.last_llm_spawn_ms + ' ms' : '—';
       document.getElementById('dbgLlm').textContent = m.last_llm_ms ? m.last_llm_ms + ' ms' : '—';
+      document.getElementById('dbgTtft').textContent = m.last_llm_ttft_ms ? m.last_llm_ttft_ms + ' ms' : '—';
+      // cache_read > 0 ⇒ the prompt cache was warm on the last turn (the win).
+      const cacheReadEl = document.getElementById('dbgCacheRead');
+      cacheReadEl.textContent = m.last_llm_cache_read_tokens ? m.last_llm_cache_read_tokens.toLocaleString() : '0';
+      cacheReadEl.className = 'val ' + (m.last_llm_cache_read_tokens ? '' : 'warn');
+      document.getElementById('dbgCacheWrite').textContent = m.last_llm_cache_creation_tokens ? m.last_llm_cache_creation_tokens.toLocaleString() : '0';
+      const toolEl = document.getElementById('dbgToolUse');
+      toolEl.textContent = m.llm_tool_use_count || '0';
+      toolEl.className = 'val ' + (m.llm_tool_use_count ? 'bad' : '');
+      document.getElementById('dbgProvider').textContent = m.last_provider || '—';
       if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
 
       // Allocator label is always populated — it's compile-time constant.
@@ -450,8 +649,13 @@
       debugPanel.classList.toggle('visible');
     });
 
-    // Init
+    // Init — restore the last capture source before populating devices.
+    const savedSource = localStorage.getItem('captureSource');
+    if (savedSource) {
+      document.getElementById('sourceSelect').value = savedSource;
+    }
     loadDevices();
+    initMode();
   </script>
 </body>
 </html>
