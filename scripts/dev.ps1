@@ -35,6 +35,22 @@ if ((Test-Path $cargoBin) -and ($env:PATH -notlike "*$cargoBin*")) {
 
 Set-Location $RepoRoot
 
+# API-mode secrets: pull from the canonical WSL ~/.claude/.env (single source of
+# truth — never hardcoded here, never committed). The app reads these from its
+# environment and, on first run, seeds them into the Windows Credential Manager
+# so later runs work even without this script. Skips any key already set.
+foreach ($k in @('GROQ_API_KEY', 'OPENAI_API_KEY')) {
+    if (-not (Get-Item "env:$k" -ErrorAction SilentlyContinue)) {
+        $val = (wsl.exe bash -lc "grep -E '^$k=' ~/.claude/.env 2>/dev/null | head -1 | cut -d= -f2-").Trim().Trim('"').Trim("'")
+        if ($val) {
+            Set-Item -Path "env:$k" -Value $val
+            Write-Host "Loaded $k from WSL ~/.claude/.env" -ForegroundColor DarkGray
+        } else {
+            Write-Host "WARN: $k not found in WSL ~/.claude/.env (API mode may fall back)" -ForegroundColor Yellow
+        }
+    }
+}
+
 # Default log level. Override by setting $env:RUST_LOG in your shell first.
 if (-not $env:RUST_LOG) {
     $env:RUST_LOG = "info,gimme_a_chance_lib=debug"

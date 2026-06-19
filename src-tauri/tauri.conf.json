@@ -16,7 +16,7 @@
             {
                 "label": "main",
                 "title": "gimme-a-chance",
-                "width": 480,
+                "width": 1000,
                 "height": 720,
                 "resizable": true,
                 "transparent": true,

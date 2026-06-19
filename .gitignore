@@ -26,6 +26,8 @@ Thumbs.db
 # Personal notes (not for the repo)
 /hot-path.md
 /changes.log
+/test-videos.md
+/test-transcript-*.txt
 
 # Secrets / auth (defensive — nothing here today, keep it that way)
 .env
