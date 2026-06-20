@@ -1,3 +1,5 @@
+#[cfg(feature = "sherpa")]
+mod aec;
 #[cfg(feature = "counting-alloc")]
 mod alloc_counter;
 mod audio;
@@ -6,6 +8,8 @@ mod claude;
 mod cloud_stt;
 mod commands;
 mod crashlog;
+#[cfg(feature = "sherpa")]
+mod dtln;
 mod error;
 mod latency;
 mod metrics;

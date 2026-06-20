@@ -125,6 +125,20 @@ impl BleedWindow {
     }
 }
 
+/// One end of the dual-capture echo-cancellation link. In "both" capture the
+/// interviewer (loopback) pipeline feeds its audio as the AEC reference; the mic
+/// pipeline receives it and cancels the interviewer's bleed out of the mic.
+/// The channel plumbing is always available; only the AEC3 engine that consumes
+/// it (in the sherpa streaming path) is feature-gated — hence the fields read
+/// as dead on cloud/whisper builds.
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub enum AecEnd {
+    /// Loopback pipeline: publishes its 16 kHz audio as the reference signal.
+    Reference(crossbeam_channel::Sender<Vec<f32>>),
+    /// Mic pipeline: receives the reference and runs echo cancellation.
+    Canceller(crossbeam_channel::Receiver<Vec<f32>>),
+}
+
 /// Which engine transcribes VAD chunks. Local whisper-rs stays as the grace
 /// fallback for the fallible engines (cloud request, native inference), so a
 /// hiccup never leaves the user without transcription mid-interview.
@@ -291,7 +305,7 @@ fn to_mono_into(samples: &[f32], channels: u16, out: &mut Vec<f32>) {
 
 /// Main audio capture + transcription loop
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(app, is_listening, metrics, whisper, engine, bleed), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker))]
+#[tracing::instrument(skip(app, is_listening, metrics, whisper, engine, bleed, aec), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker))]
 pub async fn capture_and_transcribe(
     app: AppHandle,
     is_listening: Arc<Mutex<bool>>,
@@ -302,10 +316,13 @@ pub async fn capture_and_transcribe(
     whisper: std::sync::Arc<transcriber::WhisperTranscriber>,
     engine: SttEngine,
     bleed: Option<BleedWindow>,
+    aec: Option<AecEnd>,
 ) -> Result<()> {
-    // `bleed` is only consumed by the sherpa streaming path; bind it to silence
-    // the unused warning on the cloud/whisper builds and non-streaming engines.
+    // `bleed` and `aec` are only consumed by the sherpa streaming path; bind
+    // them to silence unused warnings on cloud/whisper builds and non-streaming
+    // engines.
     let _ = &bleed;
+    let _ = &aec;
     let host = cpal::default_host();
 
     // Resolve the capture device + format. For Loopback we pick an OUTPUT device
@@ -411,6 +428,7 @@ pub async fn capture_and_transcribe(
             &mut consumer,
             sample_rate,
             bleed.as_ref(),
+            aec,
         )
         .await;
         drop(stream);
@@ -555,6 +573,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
     consumer: &mut C,
     sample_rate: u32,
     bleed: Option<&BleedWindow>,
+    aec: Option<AecEnd>,
 ) {
     // Cap on the buffered utterance audio re-decoded by Parakeet on endpoint.
     const UTTERANCE_CAP: usize = WHISPER_SAMPLE_RATE as usize * 60;
@@ -575,6 +594,25 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
     // capture passes `None`, so both are no-ops.
     let publish_bleed = bleed.filter(|_| speaker == "interviewer");
     let filter_bleed = bleed.filter(|_| speaker == "me");
+    // Echo-cancellation roles (dual capture only): the loopback pipeline forwards
+    // its audio as the reference; the mic pipeline builds an EchoCanceller and
+    // subtracts that reference from the mic before the STT ever sees it — the
+    // real fix for headset bleed, robust to volume and double-talk. A failed AEC
+    // init degrades to raw mic (the bleed dedup downstream still applies).
+    let aec_reference = match &aec {
+        Some(AecEnd::Reference(tx)) => Some(tx.clone()),
+        _ => None,
+    };
+    let mut aec_canceller = match aec {
+        Some(AecEnd::Canceller(rx)) => match crate::aec::EchoCanceller::new() {
+            Ok(c) => Some((rx, c)),
+            Err(e) => {
+                tracing::warn!(error = %e, "AEC init failed; mic runs without echo cancellation");
+                None
+            }
+        },
+        _ => None,
+    };
     // The mic pipeline needs a higher gate than the loopback one: with loud
     // playback, speaker-bleed into the mic lands just above the global 0.01
     // threshold (one ghost [You] line per session), while the user's own
@@ -608,6 +646,15 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
             break;
         }
 
+        // Pull any reference audio the loopback pipeline has forwarded, and feed
+        // it to the echo canceller BEFORE this iteration's mic capture, so the
+        // reference leads the capture the way AEC3 expects.
+        if let Some((rx, canceller)) = &mut aec_canceller {
+            while let Ok(reference) = rx.try_recv() {
+                canceller.push_reference(&reference);
+            }
+        }
+
         // Drain whatever the audio callback produced since last iteration.
         let mut temp = [0.0f32; 1024];
         loop {
@@ -616,11 +663,20 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
                 break;
             }
             let resampled = resample_to_16k(&temp[..count], sample_rate);
-            utterance_peak_rms = utterance_peak_rms.max(rms(&resampled));
-            if utterance.len() < UTTERANCE_CAP {
-                utterance.extend_from_slice(&resampled);
+            // Loopback: forward this audio as the AEC reference for the mic.
+            if let Some(tx) = &aec_reference {
+                tx.try_send(resampled.clone()).ok();
             }
-            stream.accept_waveform(WHISPER_SAMPLE_RATE.cast_signed(), &resampled);
+            // Mic: cancel the interviewer's echo before anything downstream.
+            let processed = match &mut aec_canceller {
+                Some((_, canceller)) => canceller.cancel(&resampled),
+                None => resampled,
+            };
+            utterance_peak_rms = utterance_peak_rms.max(rms(&processed));
+            if utterance.len() < UTTERANCE_CAP {
+                utterance.extend_from_slice(&processed);
+            }
+            stream.accept_waveform(WHISPER_SAMPLE_RATE.cast_signed(), &processed);
         }
 
         let decode_start = Instant::now();

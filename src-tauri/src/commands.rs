@@ -77,10 +77,13 @@ pub async fn start_listening(
     // and labeled. Otherwise a single source.
     match source.as_deref() {
         Some("both") => {
-            // Shared bleed window: the interviewer pipeline feeds it, the mic
-            // pipeline reads it to drop ghost lines (headset audio leaking into
-            // the mic). Single-source capture below passes `None`.
+            // Shared bleed window (text-level dedup backstop) + AEC reference
+            // channel (signal-level echo cancellation): the interviewer pipeline
+            // feeds both, the mic pipeline consumes both to keep the
+            // interviewer's headset bleed out of the [You] track. Single-source
+            // capture below passes `None`.
             let bleed = audio::BleedWindow::default();
+            let (aec_tx, aec_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
             spawn_pipeline(
                 app.clone(),
                 Arc::clone(&is_listening),
@@ -91,6 +94,7 @@ pub async fn start_listening(
                 Arc::clone(&whisper),
                 engine.clone(),
                 Some(bleed.clone()),
+                Some(audio::AecEnd::Reference(aec_tx)),
             );
             spawn_pipeline(
                 app,
@@ -102,6 +106,7 @@ pub async fn start_listening(
                 whisper,
                 engine,
                 Some(bleed),
+                Some(audio::AecEnd::Canceller(aec_rx)),
             );
         }
         other => {
@@ -119,6 +124,7 @@ pub async fn start_listening(
                 speaker,
                 whisper,
                 engine,
+                None,
                 None,
             );
         }
@@ -194,6 +200,7 @@ fn spawn_pipeline(
     whisper: Arc<crate::transcriber::WhisperTranscriber>,
     engine: audio::SttEngine,
     bleed: Option<audio::BleedWindow>,
+    aec: Option<audio::AecEnd>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -211,6 +218,7 @@ fn spawn_pipeline(
                 whisper,
                 engine,
                 bleed,
+                aec,
             )
             .await
             {

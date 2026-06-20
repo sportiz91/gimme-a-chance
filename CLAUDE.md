@@ -80,3 +80,28 @@ Frontend communicates with Rust via Tauri IPC (invoke/listen).
   _osfile(fh) & FOPEN" aborts; that's why it was replaced.
 - If a rebuild fails with "Acceso denegado (os error 5)" on the exe, a previous
   instance is still running: `Stop-Process -Name gimme-a-chance -Force`.
+
+## Acoustic Echo Cancellation (`aec.rs`, `dtln.rs`)
+
+In "both" capture the interviewer's audio leaks from the headset earpiece into
+the mic, so the mic pipeline transcribes the interviewer's words as ghost
+`[You]` lines. The mic pipeline cancels this echo using the loopback as the
+reference signal (routed over a channel from the interviewer pipeline). Engine
+chosen by `GIMME_AEC_ENGINE`:
+
+- **`aec3`** (default) — pure-Rust WebRTC AEC3. Lightweight, doesn't touch the
+  interviewer pipeline's latency, kills the bleed cleanly in clean-turn speech.
+- **`dtln`** — DTLN-aec (deep learning, Microsoft AEC Challenge) on the pure-Rust
+  `tract` ONNX runtime. **Experimental, NOT recommended.** Measured: per-hop p50
+  ~4ms but spikes to 29ms → backlog grows to ~1.7s under load (drops the user's
+  audio), and the cleaned audio has artifacts that degrade the final ("hello" →
+  "canoe"). Its CPU spikes also risk slowing the interviewer STT. Models aren't
+  fetched by any script — they were hand-converted from breizhn/DTLN-aec TFLite
+  to ONNX with tf2onnx and live in `%APPDATA%\gimme-a-chance\models\dtln`.
+
+**Double-talk (both speaking at once) is intentionally left imperfect.** Real
+interviews are turn-based: interviewer talks (you silent → bleed cancelled
+cleanly) then you answer (interviewer silent → your mic is clean). Simultaneous
+double-talk is rare and brief, and the info lost there is your own — not worth
+the cost (DTLN proved that). AEC3 + the text-level bleed dedup cover the real
+cases; don't reopen double-talk optimization without a concrete need.

@@ -39,6 +39,23 @@ sherpa-onnx = { version = "1.13", optional = true, default-features = false, fea
 cpal = "0.15"
 ringbuf = "0.4"
 whisper-rs = "0.16"
+# Acoustic Echo Cancellation: a pure-Rust port of WebRTC's AEC3. In "both"
+# capture the interviewer's audio leaks from the headset earpiece into the mic;
+# AEC3 cancels it using the loopback as the reference signal. Pure Rust (rustfft
+# + num-complex), so unlike `webrtc-audio-processing` it builds on Windows.
+# Gated under `sherpa` (only wired into the on-device streaming path for now).
+aec3 = { version = "0.3", optional = true }
+# DTLN-aec echo cancellation: a deep-learning AEC (Microsoft AEC Challenge, 3rd
+# place) that preserves the user's voice during double-talk far better than the
+# classic linear+suppressor AEC3. Models run on `tract` — a PURE-RUST ONNX
+# runtime — so no native onnxruntime (which would clash with sherpa's). `realfft`
+# does the 512-pt STFT the DTLN preprocessing needs.
+tract-onnx = { version = "0.23", optional = true }
+realfft = { version = "3", optional = true }
+# Lock-free channel to route the loopback audio (the AEC reference) from the
+# interviewer pipeline thread to the mic pipeline thread. Kept non-optional so
+# the `AecEnd` plumbing compiles on every build; only the AEC3 engine is gated.
+crossbeam-channel = "0.5"
 bytemuck = { version = "1", features = ["derive"] }
 hound = "3"
 chrono = "0.4"
@@ -63,7 +80,7 @@ tracy = ["dep:tracing-tracy"]
 # streaming) and Kokoro TTS. Gated because it links native libs + needs models
 # downloaded. The default build stays pure-cloud (whisper-rs STT + OpenAI TTS).
 # Activate with: cargo build --features sherpa  (after scripts/fetch-models.ps1)
-sherpa = ["dep:sherpa-onnx"]
+sherpa = ["dep:sherpa-onnx", "dep:aec3", "dep:tract-onnx", "dep:realfft"]
 # DIY heap profiler: wraps the system allocator and counts bytes allocated/freed,
 # plus a 16-bucket logarithmic histogram of alloc sizes and peak-live tracking.
 # Mutually exclusive with the default `assert_no_alloc` guard (only one
@@ -80,6 +97,22 @@ mimalloc = ["dep:mimalloc"]
 # Mutually exclusive with `counting-alloc` and `assert_no_alloc`.
 # Activate with: cargo build --features dhat-heap
 dhat-heap = ["dep:dhat"]
+
+# DTLN-aec runs two LSTM models ~125x/second; unoptimized (debug) tract can't
+# keep up with real time, so the mic pipeline would lag. Build the tract compute
+# crates with optimizations even in dev (same trick as whisper-rs's RelWithDeb).
+[profile.dev.package.tract-core]
+opt-level = 3
+[profile.dev.package.tract-linalg]
+opt-level = 3
+[profile.dev.package.tract-onnx]
+opt-level = 3
+[profile.dev.package.tract-hir]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
 
 [lints.rust]
 # `deny` instead of `forbid` so modules that legitimately need it (like the
