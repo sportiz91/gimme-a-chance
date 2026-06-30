@@ -24,10 +24,12 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+
+use crate::lang::Language;
 use sherpa_onnx::{
-    GenerationConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
-    OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig, OnlineRecognizer,
-    OnlineRecognizerConfig,
+    GenerationConfig, OfflineCanaryModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineTransducerModelConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
+    OnlineRecognizer, OnlineRecognizerConfig,
 };
 
 /// Kokoro en-v0_19 speaker id. Voice order: `af`(0), `af_bella`, `af_nicole`,
@@ -51,8 +53,9 @@ pub fn models_dir() -> PathBuf {
 
 /// Locate the directory holding `marker` under `models_dir()/sub` — either the
 /// directory itself or one level down (tar archives extract into a nested
-/// folder like `parakeet/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/`).
-fn find_model_root(sub: &str, marker: &str) -> Option<PathBuf> {
+/// folder like `parakeet/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/`). `sub` is a
+/// relative path so callers can nest by language (e.g. `es/parakeet`).
+fn find_model_root(sub: &Path, marker: &str) -> Option<PathBuf> {
     let base = models_dir().join(sub);
     if base.join(marker).exists() {
         return Some(base);
@@ -95,30 +98,63 @@ fn path_str(path: &Path) -> String {
 // Parakeet STT (offline, per VAD chunk)
 // ---------------------------------------------------------------------------
 
-/// Offline `NeMo` Parakeet TDT 0.6b (int8). The `Mutex` is deliberate even
-/// though `OfflineRecognizer` is `Send + Sync`: it serializes decodes so the
-/// dual-capture pipelines never run two Parakeet passes concurrently — on a
-/// 4-core laptop that halves each decode's speed and blows the speculative
-/// window (measured: 8s of audio jumped from ~0.8s to ~2.1s under contention).
+/// Offline `NeMo` transducer for high-quality finals. The model differs by
+/// language, but the sherpa-onnx API (encoder/decoder/joiner) does not — only the
+/// model directory changes:
+/// - **English** — Parakeet-TDT 0.6b v2 (int8), under `parakeet/`.
+/// - **Spanish** — NVIDIA `Canary-180m-flash`, under `es/parakeet/`, PINNED to
+///   Spanish via `src_lang`/`tgt_lang` = "es". The multilingual Parakeet-TDT v3 (a
+///   transducer) is avoided: it auto-detects language per utterance and flipped
+///   ~1/3 of Spanish utterances to English ("voy a usar la plataforma…" → "We use
+///   the platform…"), and sherpa-onnx's offline TRANSDUCER config exposes no
+///   language pin (verified in c-api.h). Canary is an attention enc-dec whose config
+///   DOES take a source language, so it stays in Spanish AND keeps high accuracy. (A
+///   monolingual `fast-conformer-es` was tried first but transcribed rioplatense
+///   poorly — "Gull eschamp" for "voy a usar la plataforma".)
+///
+/// The `Mutex` is deliberate even though `OfflineRecognizer` is `Send + Sync`: it
+/// serializes decodes so the dual-capture pipelines never run two passes
+/// concurrently — on a 4-core laptop that halves each decode's speed and blows the
+/// speculative window (measured: 8s of audio jumped from ~0.8s to ~2.1s under
+/// contention).
 pub struct ParakeetStt {
     recognizer: std::sync::Mutex<OfflineRecognizer>,
 }
 
 impl ParakeetStt {
-    pub fn new() -> Result<Self> {
-        let root = find_model_root("parakeet", "tokens.txt").ok_or_else(|| {
+    pub fn new(lang: Language) -> Result<Self> {
+        let sub = lang.sherpa_subdir("parakeet");
+        let root = find_model_root(&sub, "tokens.txt").ok_or_else(|| {
             anyhow!(
-                "Parakeet model not found under {} — run scripts/fetch-models.ps1",
-                models_dir().join("parakeet").display()
+                "Parakeet ({}) model not found under {} — run scripts/fetch-models.ps1",
+                lang.tag(),
+                models_dir().join(&sub).display()
             )
         })?;
         let t0 = Instant::now();
         let mut config = OfflineRecognizerConfig::default();
-        config.model_config.transducer = OfflineTransducerModelConfig {
-            encoder: Some(find_onnx(&root, "encoder")?),
-            decoder: Some(find_onnx(&root, "decoder")?),
-            joiner: Some(find_onnx(&root, "joiner")?),
-        };
+        match lang {
+            // English: Parakeet-TDT transducer (encoder/decoder/joiner).
+            Language::English => {
+                config.model_config.transducer = OfflineTransducerModelConfig {
+                    encoder: Some(find_onnx(&root, "encoder")?),
+                    decoder: Some(find_onnx(&root, "decoder")?),
+                    joiner: Some(find_onnx(&root, "joiner")?),
+                };
+            }
+            // Spanish: Canary attention enc-dec (encoder/decoder, no joiner), pinned
+            // to Spanish so it can't auto-detect into English. `use_pnc` keeps the
+            // punctuation+casing the LLM and the on-screen transcript expect.
+            Language::Spanish => {
+                config.model_config.canary = OfflineCanaryModelConfig {
+                    encoder: Some(find_onnx(&root, "encoder")?),
+                    decoder: Some(find_onnx(&root, "decoder")?),
+                    src_lang: Some("es".into()),
+                    tgt_lang: Some("es".into()),
+                    use_pnc: true,
+                };
+            }
+        }
         config.model_config.tokens = Some(path_str(&root.join("tokens.txt")));
         config.model_config.num_threads = 4;
         let recognizer = OfflineRecognizer::create(&config)
@@ -147,20 +183,26 @@ impl ParakeetStt {
     }
 }
 
-/// Shared Parakeet instance, loaded once per app run. `None` means it isn't
-/// usable (models missing or load failed — already logged) and the caller
-/// should fall back to the default engine chain.
-pub fn parakeet() -> Option<&'static ParakeetStt> {
-    static PARAKEET: OnceLock<Option<ParakeetStt>> = OnceLock::new();
-    PARAKEET
-        .get_or_init(|| match ParakeetStt::new() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(error = %e, "Parakeet unavailable");
-                None
-            }
-        })
-        .as_ref()
+/// Shared Parakeet instance for `lang`, loaded once per language per app run.
+/// `None` means it isn't usable (models missing or load failed — already logged)
+/// and the caller should fall back to the default engine chain. Each language has
+/// its own `OnceLock`, so switching language lazily loads (then caches) that
+/// language's model without disturbing the other.
+pub fn parakeet(lang: Language) -> Option<&'static ParakeetStt> {
+    static EN: OnceLock<Option<ParakeetStt>> = OnceLock::new();
+    static ES: OnceLock<Option<ParakeetStt>> = OnceLock::new();
+    let cell = match lang {
+        Language::English => &EN,
+        Language::Spanish => &ES,
+    };
+    cell.get_or_init(|| match ParakeetStt::new(lang) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, lang = lang.tag(), "Parakeet unavailable");
+            None
+        }
+    })
+    .as_ref()
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +218,13 @@ pub struct StreamingStt {
 }
 
 impl StreamingStt {
-    pub fn new() -> Result<Self> {
-        let root = find_model_root("streaming", "tokens.txt").ok_or_else(|| {
+    pub fn new(lang: Language) -> Result<Self> {
+        let sub = lang.sherpa_subdir("streaming");
+        let root = find_model_root(&sub, "tokens.txt").ok_or_else(|| {
             anyhow!(
-                "streaming model not found under {} — run scripts/fetch-models.ps1",
-                models_dir().join("streaming").display()
+                "streaming ({}) model not found under {} — run scripts/fetch-models.ps1",
+                lang.tag(),
+                models_dir().join(&sub).display()
             )
         })?;
         let t0 = Instant::now();
@@ -214,19 +258,23 @@ impl StreamingStt {
     }
 }
 
-/// Shared streaming recognizer, loaded once per app run. Same `None` contract
-/// as [`parakeet`].
-pub fn streaming() -> Option<&'static StreamingStt> {
-    static STREAMING: OnceLock<Option<StreamingStt>> = OnceLock::new();
-    STREAMING
-        .get_or_init(|| match StreamingStt::new() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "streaming STT unavailable");
-                None
-            }
-        })
-        .as_ref()
+/// Shared streaming recognizer for `lang`, loaded once per language per app run.
+/// Same per-language `OnceLock` and `None` contract as [`parakeet`].
+pub fn streaming(lang: Language) -> Option<&'static StreamingStt> {
+    static EN: OnceLock<Option<StreamingStt>> = OnceLock::new();
+    static ES: OnceLock<Option<StreamingStt>> = OnceLock::new();
+    let cell = match lang {
+        Language::English => &EN,
+        Language::Spanish => &ES,
+    };
+    cell.get_or_init(|| match StreamingStt::new(lang) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, lang = lang.tag(), "streaming STT unavailable");
+            None
+        }
+    })
+    .as_ref()
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +311,9 @@ pub fn kokoro_tts(text: &str) -> Result<Option<Vec<u8>>> {
 }
 
 fn init_kokoro() -> Option<OfflineTts> {
-    let Some(root) = find_model_root("kokoro", "model.onnx") else {
+    // Kokoro stays English-only: sherpa-onnx ships no Spanish voices, so Spanish
+    // TTS goes through the OpenAI fallback in `crate::tts`.
+    let Some(root) = find_model_root(Path::new("kokoro"), "model.onnx") else {
         tracing::info!(
             dir = %models_dir().join("kokoro").display(),
             "Kokoro model not present — TTS will use OpenAI (run scripts/fetch-models.ps1 for local)"

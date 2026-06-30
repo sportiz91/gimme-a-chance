@@ -12,6 +12,8 @@ use std::io::Cursor;
 use anyhow::{bail, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::lang::Language;
+
 const URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 const MODEL: &str = "whisper-large-v3-turbo";
 /// Browser UA — Groq sits behind Cloudflare, which 403s (error 1010) the default
@@ -22,18 +24,24 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 pub struct GroqStt {
     client: reqwest::Client,
     key: SecretString,
+    language: Language,
 }
 
 impl GroqStt {
-    /// Build the engine, or `None` if there's no `GROQ_API_KEY` (caller uses local).
+    /// Build the engine for `language`, or `None` if there's no `GROQ_API_KEY`
+    /// (caller uses local).
     #[must_use]
-    pub fn new() -> Option<Self> {
+    pub fn new(language: Language) -> Option<Self> {
         let key = crate::secrets::load_key("GROQ_API_KEY")?;
         let client = reqwest::Client::builder()
             .user_agent(BROWSER_UA)
             .build()
             .ok()?;
-        Some(Self { client, key })
+        Some(Self {
+            client,
+            key,
+            language,
+        })
     }
 
     /// Transcribe a WAV blob. Returns the recognized text (may be empty for silence).
@@ -44,10 +52,11 @@ impl GroqStt {
         let form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("model", MODEL)
-            // Force English: interviews are in English and the local fallback model
-            // is English-only (base.en). Without this, Whisper auto-detects and
-            // transcribes (e.g.) Spanish speech in Spanish.
-            .text("language", "en")
+            // Pin the language to the user's choice instead of letting Whisper
+            // auto-detect: it keeps the local fallback (English-only `base.en` or
+            // multilingual `base`) consistent with the cloud result, and stops
+            // Whisper from drifting into the wrong language mid-interview.
+            .text("language", self.language.whisper_code())
             .text("response_format", "text");
 
         let resp = self

@@ -24,14 +24,27 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::lang::Language;
+
 /// Browser User-Agent. Groq sits behind Cloudflare, whose bot filter 403s
 /// (error 1010) non-browser client signatures like the default reqwest UA.
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const SYSTEM_PROMPT: &str = "You are a real-time interview copilot. Answer directly and \
+const SYSTEM_PROMPT_EN: &str = "You are a real-time interview copilot. Answer directly and \
 concisely so the user can read your answer out loud. Keep it under 4 sentences unless it's \
 a coding question, in which case give the code and explain the approach in 1-2 sentences first.";
+const SYSTEM_PROMPT_ES: &str = "Sos un copiloto de entrevistas en tiempo real. Respondé en \
+español, de forma directa y concisa, para que el usuario pueda leer la respuesta en voz alta. \
+Máximo 4 oraciones, salvo que sea una pregunta de código, en cuyo caso dá el código y explicá \
+el enfoque en 1-2 oraciones primero.";
+
+fn system_prompt(language: Language) -> &'static str {
+    match language {
+        Language::English => SYSTEM_PROMPT_EN,
+        Language::Spanish => SYSTEM_PROMPT_ES,
+    }
+}
 
 /// Budget to first streamed token. Exceeding it cascades to the next provider.
 const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(4);
@@ -131,12 +144,6 @@ impl ApiBackend {
         }
     }
 
-    /// True if at least one provider in the chain has a usable key.
-    #[must_use]
-    pub fn any_key_present(&self) -> bool {
-        self.groq.is_some() || self.openai.is_some()
-    }
-
     fn key_for(&self, key_env: &str) -> Option<&SecretString> {
         match key_env {
             "GROQ_API_KEY" => self.groq.as_ref(),
@@ -151,17 +158,22 @@ impl ApiBackend {
         &self,
         question: &str,
         context: &str,
+        language: Language,
         trace_id: &str,
         app: &AppHandle,
     ) -> Result<ApiOutcome> {
-        let prompt = build_user(question, context);
+        let prompt = build_user(question, context, language);
+        let system = system_prompt(language);
         let mut last_err = anyhow!("no providers available (no API keys?)");
         for p in CHAIN {
             let Some(key) = self.key_for(p.key_env) else {
                 tracing::warn!(provider = p.name, "skipping provider — no key");
                 continue;
             };
-            match self.try_provider(p, key, &prompt, trace_id, app).await {
+            match self
+                .try_provider(p, key, system, &prompt, trace_id, app)
+                .await
+            {
                 Ok(outcome) => {
                     tracing::info!(
                         provider = p.name,
@@ -187,6 +199,7 @@ impl ApiBackend {
         &self,
         p: &Provider,
         key: &SecretString,
+        system: &str,
         prompt: &str,
         trace_id: &str,
         app: &AppHandle,
@@ -194,7 +207,7 @@ impl ApiBackend {
         let body = json!({
             "model": p.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             "stream": true,
@@ -309,18 +322,39 @@ impl ApiBackend {
     }
 }
 
-fn build_user(question: &str, context: &str) -> String {
-    if context.is_empty() {
-        question.to_string()
-    } else {
-        format!(
-            "Interview context (recent transcription):\n\
-             ---\n\
-             {context}\n\
-             ---\n\n\
-             The interviewer just asked: \"{question}\"\n\n\
-             Give a concise, direct answer I can say out loud."
-        )
+fn build_user(question: &str, context: &str, language: Language) -> String {
+    // The language directive lives in the system prompt (sent every turn here), so
+    // an empty-context user prompt can stay bare — the model already knows to
+    // answer in the chosen language.
+    match language {
+        Language::English => {
+            if context.is_empty() {
+                question.to_string()
+            } else {
+                format!(
+                    "Interview context (recent transcription):\n\
+                     ---\n\
+                     {context}\n\
+                     ---\n\n\
+                     The interviewer just asked: \"{question}\"\n\n\
+                     Give a concise, direct answer I can say out loud."
+                )
+            }
+        }
+        Language::Spanish => {
+            if context.is_empty() {
+                question.to_string()
+            } else {
+                format!(
+                    "Contexto de la entrevista (transcripción reciente):\n\
+                     ---\n\
+                     {context}\n\
+                     ---\n\n\
+                     El entrevistador acaba de preguntar: \"{question}\"\n\n\
+                     Dame una respuesta concisa y directa para leer en voz alta."
+                )
+            }
+        }
     }
 }
 

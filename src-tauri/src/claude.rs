@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
+
+use crate::lang::Language;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -85,9 +87,19 @@ impl ClaudeSession {
     }
 
     /// Ask a real interview question. Streams deltas to the frontend.
-    pub async fn ask(&self, question: &str, context: &str, trace_id: &str) -> Result<AskOutcome> {
-        self.send(build_prompt(question, context), trace_id.to_string(), true)
-            .await
+    pub async fn ask(
+        &self,
+        question: &str,
+        context: &str,
+        language: Language,
+        trace_id: &str,
+    ) -> Result<AskOutcome> {
+        self.send(
+            build_prompt(question, context, language),
+            trace_id.to_string(),
+            true,
+        )
+        .await
     }
 
     /// Warm up (or keep warm) the session: boots the process on first call and
@@ -118,18 +130,43 @@ impl ClaudeSession {
 /// Build the user-facing prompt (mirrors the old one-shot behaviour). The terse
 /// instructions also live in the system prompt; keeping a light version here makes
 /// each message self-describing if the system prompt ever changes.
-fn build_prompt(question: &str, context: &str) -> String {
-    if context.is_empty() {
-        question.to_string()
-    } else {
-        format!(
-            "Interview context (recent transcription):\n\
-             ---\n\
-             {context}\n\
-             ---\n\n\
-             The interviewer just asked: \"{question}\"\n\n\
-             Give a concise, direct answer I can say out loud."
-        )
+///
+/// The persistent session's system prompt is fixed (English) at spawn time, so the
+/// Spanish *answer* directive must ride in the user prompt — that's why Spanish adds
+/// "en español" explicitly even in the no-context case.
+fn build_prompt(question: &str, context: &str, language: Language) -> String {
+    match language {
+        Language::English => {
+            if context.is_empty() {
+                question.to_string()
+            } else {
+                format!(
+                    "Interview context (recent transcription):\n\
+                     ---\n\
+                     {context}\n\
+                     ---\n\n\
+                     The interviewer just asked: \"{question}\"\n\n\
+                     Give a concise, direct answer I can say out loud."
+                )
+            }
+        }
+        Language::Spanish => {
+            if context.is_empty() {
+                format!(
+                    "{question}\n\n\
+                     Respondé en español, conciso y directo, para leer en voz alta."
+                )
+            } else {
+                format!(
+                    "Contexto de la entrevista (transcripción reciente):\n\
+                     ---\n\
+                     {context}\n\
+                     ---\n\n\
+                     El entrevistador acaba de preguntar: \"{question}\"\n\n\
+                     Dame una respuesta concisa y directa, en español, para leer en voz alta."
+                )
+            }
+        }
     }
 }
 

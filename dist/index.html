@@ -219,6 +219,10 @@
         <option value="api">API (Groq→OpenAI)</option>
         <option value="claude_code">Claude Code</option>
       </select>
+      <select id="langSelect" onchange="setLanguage()" title="Language (transcription + answers)" style="flex:0 0 auto; max-width:120px">
+        <option value="english">English</option>
+        <option value="spanish">Español</option>
+      </select>
       <button id="listenBtn" onclick="toggleListening()">Listen</button>
       <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Also answer questions YOU ask via the mic">
         <input type="checkbox" id="answerMe"> answer me
@@ -277,6 +281,9 @@
     const { listen } = window.__TAURI__.event;
 
     let isListening = false;
+    // Selected language ('english' | 'spanish'). Drives question detection below;
+    // the backend reads its own copy (set via set_language) on each Listen/answer.
+    let currentLang = 'english';
     let transcriptLines = [];
     // Streaming engine only: per-speaker partial hypothesis, rendered as a gray
     // italic tail line that refines in place until the final replaces it.
@@ -371,6 +378,31 @@
         document.getElementById('modeSelect').value = m;
       } catch (e) {
         console.error('get_mode failed:', e);
+      }
+    }
+
+    async function setLanguage() {
+      const language = document.getElementById('langSelect').value;
+      currentLang = language;
+      localStorage.setItem('language', language);
+      try {
+        await invoke('set_language', { language });
+        log('info', 'language_set', { language });
+      } catch (e) {
+        console.error('set_language failed:', e);
+      }
+    }
+
+    // Restore the persisted language, reflect it in the dropdown, and push it to
+    // the backend so both sides agree before the first Listen.
+    async function initLanguage() {
+      const saved = localStorage.getItem('language') || 'english';
+      currentLang = saved;
+      document.getElementById('langSelect').value = saved;
+      try {
+        await invoke('set_language', { language: saved });
+      } catch (e) {
+        console.error('set_language (init) failed:', e);
       }
     }
 
@@ -534,22 +566,44 @@
     });
 
     // Rhetorical / confirmatory fillers — mostly the candidate checking in, not
-    // interviewer questions worth answering.
-    function isRhetorical(s) {
-      const t = s.toLowerCase();
-      return [
+    // interviewer questions worth answering. Keyed by language (see currentLang).
+    const RHETORICAL = {
+      english: [
         'right?', 'ok?', 'okay?', 'correct?', 'got it?', 'alright?', 'all right?',
         'yeah?', 'cool?', 'you know?', 'is that fine', 'does that make sense',
         'make sense?', 'anything so far', 'sound good', 'sounds good',
-      ].some(r => t.includes(r));
+      ],
+      spanish: [
+        '¿no?', 'no?', '¿sí?', 'sí?', '¿ok?', 'ok?', '¿correcto?', 'correcto?',
+        '¿se entiende?', 'se entiende', '¿tiene sentido?', 'tiene sentido',
+        '¿está bien?', 'está bien', '¿dale?', 'dale?', '¿viste?', 'viste?',
+        '¿todo bien', 'hasta acá',
+      ],
+    };
+    function isRhetorical(s) {
+      const t = s.toLowerCase();
+      return (RHETORICAL[currentLang] || RHETORICAL.english).some(r => t.includes(r));
     }
 
-    const Q_STARTERS = [
-      'what ', 'how ', 'why ', 'can you', 'could you', 'tell me ', 'explain ',
-      'describe ', 'what\'s', 'where ', 'when ', 'which ', 'walk me through',
-      'how would', 'how do', 'what are', 'what would', 'design a', 'design the',
-      'would you ', 'do you ', 'have you ',
-    ];
+    // Sentence openers that signal an interviewer question when there's no '?'.
+    const Q_STARTERS = {
+      english: [
+        'what ', 'how ', 'why ', 'can you', 'could you', 'tell me ', 'explain ',
+        'describe ', 'what\'s', 'where ', 'when ', 'which ', 'walk me through',
+        'how would', 'how do', 'what are', 'what would', 'design a', 'design the',
+        'would you ', 'do you ', 'have you ',
+      ],
+      spanish: [
+        'qué ', 'que ', 'cómo ', 'como ', 'por qué', 'por que', 'cuál', 'cual',
+        'cuándo', 'cuando', 'dónde', 'donde', 'quién', 'quien', 'podés', 'podrías',
+        'podrias', 'contame', 'contás', 'explicá', 'explicame', 'describí',
+        'describime', 'hablame de', 'háblame de', 'diseñá', 'diseña ', 'me podés',
+        'me das', 'alguna vez', 'tenés', 'tenes ', 'sabés', 'sabes ',
+      ],
+    };
+    function qStarters() {
+      return Q_STARTERS[currentLang] || Q_STARTERS.english;
+    }
 
     // Extract a real question from a text window, or null. Handles a '?' anywhere
     // (not just at the end) and pulls a clean lead-in so we send the LLM just the
@@ -570,8 +624,10 @@
       // No '?': accept a last sentence that starts like an interviewer question.
       const sentences = text.split(/(?<=[.?!])\s+/).map(s => s.trim()).filter(Boolean);
       const last = sentences[sentences.length - 1] || '';
+      // Strip leading Spanish inverted marks so '¿qué...' matches the 'qué' starter.
+      const lastNorm = last.toLowerCase().replace(/^[¿¡\s]+/, '');
       if (last.length >= 12 && !isRhetorical(last) &&
-          Q_STARTERS.some(st => last.toLowerCase().startsWith(st))) {
+          qStarters().some(st => lastNorm.startsWith(st))) {
         return last;
       }
       return null;
@@ -656,6 +712,7 @@
     }
     loadDevices();
     initMode();
+    initLanguage();
   </script>
 </body>
 </html>

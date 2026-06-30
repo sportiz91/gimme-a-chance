@@ -48,29 +48,45 @@ pub async fn start_listening(
     let is_listening = Arc::clone(&state.is_listening);
     let metrics = Arc::clone(&state.metrics);
 
-    // Shared local whisper model (preloaded at startup; built lazily on first use
-    // if the preload hasn't finished). One instance serves both dual pipelines.
-    let whisper = if let Some(w) = state.whisper.get() {
+    // The language the UI selected (default English). Drives the on-device model
+    // set, the cloud/local Whisper language param, and (downstream) the answer
+    // prompts. Read once per Listen, so switching language takes effect on the
+    // next Listen.
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+
+    // Local whisper model for this language — the offline STT fallback. English
+    // (`base.en`) is preloaded at startup; Spanish (multilingual `base`) is built
+    // lazily on the first Spanish Listen and cached. One instance serves both dual
+    // pipelines.
+    let whisper_cell = match language {
+        crate::lang::Language::English => &state.whisper,
+        crate::lang::Language::Spanish => &state.whisper_es,
+    };
+    let whisper = if let Some(w) = whisper_cell.get() {
         Arc::clone(w)
     } else {
         let w = Arc::new(
-            crate::transcriber::WhisperTranscriber::new()
+            crate::transcriber::WhisperTranscriber::new(language)
                 .map_err(|e| AppError::Other(anyhow::anyhow!(e)))?,
         );
-        let _ = state.whisper.set(Arc::clone(&w));
+        let _ = whisper_cell.set(Arc::clone(&w));
         w
     };
 
     // STT engine: GIMME_STT_ENGINE = "whisper" (force local) | "sherpa"
-    // (on-device Parakeet, per chunk) | "streaming" (on-device Nemotron with
+    // (on-device Parakeet, per chunk) | "streaming" (on-device hybrid with
     // live partials) | unset → Groq cloud. The on-device engines need
-    // --features sherpa + fetched models.
+    // --features sherpa + fetched models. All resolve the model set for `language`.
     let stt_pref = std::env::var("GIMME_STT_ENGINE").unwrap_or_default();
     let engine = match stt_pref.as_str() {
         "whisper" => audio::SttEngine::LocalWhisper,
-        "sherpa" | "parakeet" => sherpa_engine_or_default(),
-        "streaming" | "online" => streaming_engine_or_default(),
-        _ => default_stt_engine(),
+        "sherpa" | "parakeet" => sherpa_engine_or_default(language),
+        "streaming" | "online" => streaming_engine_or_default(language),
+        _ => default_stt_engine(language),
     };
 
     // "both" → dual capture: loopback (interviewer) + mic (you), both transcribed
@@ -93,6 +109,7 @@ pub async fn start_listening(
                 "interviewer",
                 Arc::clone(&whisper),
                 engine.clone(),
+                language,
                 Some(bleed.clone()),
                 Some(audio::AecEnd::Reference(aec_tx)),
             );
@@ -105,6 +122,7 @@ pub async fn start_listening(
                 "me",
                 whisper,
                 engine,
+                language,
                 Some(bleed),
                 Some(audio::AecEnd::Canceller(aec_rx)),
             );
@@ -124,6 +142,7 @@ pub async fn start_listening(
                 speaker,
                 whisper,
                 engine,
+                language,
                 None,
                 None,
             );
@@ -134,19 +153,19 @@ pub async fn start_listening(
 }
 
 /// Default chain: Groq cloud Whisper when a key is present, else local whisper.
-fn default_stt_engine() -> audio::SttEngine {
-    crate::cloud_stt::GroqStt::new()
+fn default_stt_engine(language: crate::lang::Language) -> audio::SttEngine {
+    crate::cloud_stt::GroqStt::new(language)
         .map(Arc::new)
         .map_or(audio::SttEngine::LocalWhisper, audio::SttEngine::Groq)
 }
 
-/// `GIMME_STT_ENGINE=sherpa`: on-device Parakeet if this build carries the
-/// `sherpa` feature and the models are fetched; otherwise warn and use the
-/// default chain rather than dying mid-setup.
-fn sherpa_engine_or_default() -> audio::SttEngine {
+/// `GIMME_STT_ENGINE=sherpa`: on-device Parakeet (for `language`) if this build
+/// carries the `sherpa` feature and the models are fetched; otherwise warn and use
+/// the default chain rather than dying mid-setup.
+fn sherpa_engine_or_default(language: crate::lang::Language) -> audio::SttEngine {
     #[cfg(feature = "sherpa")]
     {
-        if let Some(p) = crate::stt::parakeet() {
+        if let Some(p) = crate::stt::parakeet(language) {
             return audio::SttEngine::Parakeet(p);
         }
         tracing::warn!(
@@ -157,19 +176,20 @@ fn sherpa_engine_or_default() -> audio::SttEngine {
     tracing::warn!(
         "GIMME_STT_ENGINE=sherpa but this build lacks the `sherpa` feature; using default STT engine"
     );
-    default_stt_engine()
+    default_stt_engine(language)
 }
 
-/// `GIMME_STT_ENGINE=streaming`: hybrid on-device engine — live partials from
-/// the light online model, finals re-decoded with Parakeet; same
+/// `GIMME_STT_ENGINE=streaming`: hybrid on-device engine for `language` — live
+/// partials from the light online model, finals re-decoded with Parakeet; same
 /// degrade-to-default contract as the Parakeet path.
-fn streaming_engine_or_default() -> audio::SttEngine {
+fn streaming_engine_or_default(language: crate::lang::Language) -> audio::SttEngine {
     #[cfg(feature = "sherpa")]
     {
-        if let Some(s) = crate::stt::streaming() {
-            // Warm Parakeet now so the first endpoint doesn't pay the model
-            // load; if it's missing, finals fall back to the online hypothesis.
-            if crate::stt::parakeet().is_none() {
+        if let Some(s) = crate::stt::streaming(language) {
+            // Warm Parakeet (for this language) now so the first endpoint doesn't
+            // pay the model load; if it's missing, finals fall back to the online
+            // hypothesis.
+            if crate::stt::parakeet(language).is_none() {
                 tracing::warn!(
                     "Parakeet unavailable — streaming finals will use the online hypothesis"
                 );
@@ -184,7 +204,7 @@ fn streaming_engine_or_default() -> audio::SttEngine {
     tracing::warn!(
         "GIMME_STT_ENGINE=streaming but this build lacks the `sherpa` feature; using default STT engine"
     );
-    default_stt_engine()
+    default_stt_engine(language)
 }
 
 /// Spawn one capture+transcribe pipeline on its own OS thread (`cpal::Stream` isn't
@@ -199,6 +219,7 @@ fn spawn_pipeline(
     speaker: &'static str,
     whisper: Arc<crate::transcriber::WhisperTranscriber>,
     engine: audio::SttEngine,
+    language: crate::lang::Language,
     bleed: Option<audio::BleedWindow>,
     aec: Option<audio::AecEnd>,
 ) {
@@ -217,6 +238,7 @@ fn spawn_pipeline(
                 speaker,
                 whisper,
                 engine,
+                language,
                 bleed,
                 aec,
             )
@@ -262,6 +284,11 @@ pub async fn ask_claude(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
     match mode {
         Mode::ClaudeCode => {
@@ -270,7 +297,7 @@ pub async fn ask_claude(
                 .get()
                 .ok_or_else(|| AppError::Claude("claude session not ready yet".into()))?;
             let outcome = session
-                .ask(&question, &context, &trace_id)
+                .ask(&question, &context, language, &trace_id)
                 .await
                 .map_err(|e| AppError::Claude(e.to_string()))?;
             metrics
@@ -296,7 +323,7 @@ pub async fn ask_claude(
         Mode::Api => {
             let outcome = state
                 .api
-                .ask(&question, &context, &trace_id, &app)
+                .ask(&question, &context, language, &trace_id, &app)
                 .await
                 .map_err(|e| AppError::Claude(e.to_string()))?;
             metrics
@@ -350,9 +377,14 @@ pub async fn simulate_interviewer(
     state: tauri::State<'_, AppState>,
     text: String,
 ) -> Result<String, AppError> {
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     let outcome = state
         .tts
-        .synthesize_and_save(&text)
+        .synthesize_and_save(&text, language)
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!(e)))?;
     crate::tts::play_file(&outcome.wav_path);
@@ -373,6 +405,36 @@ pub fn get_mode(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
         Mode::Api => "api".into(),
         Mode::ClaudeCode => "claude_code".into(),
     })
+}
+
+/// Switch the transcription + answer language at runtime (`"english"` or
+/// `"spanish"`). Takes effect on the next Listen (STT engine rebuilt) and the next
+/// answer (prompt rebuilt) — see `crate::lang`.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_language(state: tauri::State<'_, AppState>, language: String) -> Result<(), AppError> {
+    let new_lang = crate::lang::Language::from_tag(&language)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown language: {language}")))?;
+    let mut guard = state
+        .language
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    *guard = new_lang;
+    tracing::info!(?new_lang, "transcription/answer language switched");
+    Ok(())
+}
+
+/// Current language as a string (for the UI to reflect on load).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn get_language(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(language.tag().to_string())
 }
 
 /// Structured log entry forwarded from the frontend so that JS timings

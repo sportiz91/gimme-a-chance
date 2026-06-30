@@ -11,6 +11,7 @@ mod crashlog;
 #[cfg(feature = "sherpa")]
 mod dtln;
 mod error;
+mod lang;
 mod latency;
 mod metrics;
 mod secrets;
@@ -91,11 +92,18 @@ pub struct AppState {
     pub api: Arc<backend::ApiBackend>,
     /// Which backend answers `ask_claude`. Toggled from the UI; default = API.
     pub mode: Arc<Mutex<backend::Mode>>,
+    /// Transcription + answer language. Toggled from the UI; default = English.
+    /// Read at `start_listening` (STT engine) and `ask_claude` (prompt) time.
+    pub language: Arc<Mutex<lang::Language>>,
     /// Text-to-speech engine for the "simulate interviewer" self-test.
     pub tts: Arc<tts::TtsEngine>,
-    /// The local whisper model, loaded once and shared across Listen sessions and
-    /// (in dual mode) both capture pipelines — the offline STT fallback.
+    /// The local English whisper model (`base.en`), loaded once and shared across
+    /// Listen sessions and (in dual mode) both capture pipelines — the offline STT
+    /// fallback.
     pub whisper: Arc<OnceLock<Arc<transcriber::WhisperTranscriber>>>,
+    /// The local Spanish whisper model (multilingual `base`), loaded lazily on the
+    /// first Spanish Listen so English users never pay for it.
+    pub whisper_es: Arc<OnceLock<Arc<transcriber::WhisperTranscriber>>>,
 }
 
 impl Default for AppState {
@@ -107,8 +115,10 @@ impl Default for AppState {
             claude: Arc::new(OnceLock::new()),
             api: Arc::new(backend::ApiBackend::new()),
             mode: Arc::new(Mutex::new(backend::Mode::Api)),
+            language: Arc::new(Mutex::new(lang::Language::default())),
             tts: Arc::new(tts::TtsEngine::new()),
             whisper: Arc::new(OnceLock::new()),
+            whisper_es: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -203,12 +213,16 @@ pub fn run() {
 
     // Preload the whisper model at startup (off the main thread) so the first
     // "Listen" doesn't pay the ~140MB load, and so it's loaded only once.
-    std::thread::spawn(move || match transcriber::WhisperTranscriber::new() {
-        Ok(w) => {
-            _ = whisper_cell.set(Arc::new(w));
-            tracing::info!("whisper model preloaded at startup");
+    std::thread::spawn(move || {
+        match transcriber::WhisperTranscriber::new(lang::Language::English) {
+            Ok(w) => {
+                _ = whisper_cell.set(Arc::new(w));
+                tracing::info!("whisper model preloaded at startup");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "whisper preload failed (will retry on first Listen)");
+            }
         }
-        Err(e) => tracing::warn!(error = %e, "whisper preload failed (will retry on first Listen)"),
     });
 
     tauri::Builder::default()
@@ -350,6 +364,8 @@ pub fn run() {
             commands::ask_claude,
             commands::set_mode,
             commands::get_mode,
+            commands::set_language,
+            commands::get_language,
             commands::simulate_interviewer,
             commands::log_from_frontend,
         ])

@@ -305,7 +305,7 @@ fn to_mono_into(samples: &[f32], channels: u16, out: &mut Vec<f32>) {
 
 /// Main audio capture + transcription loop
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(app, is_listening, metrics, whisper, engine, bleed, aec), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker))]
+#[tracing::instrument(skip(app, is_listening, metrics, whisper, engine, language, bleed, aec), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker, lang = language.tag()))]
 pub async fn capture_and_transcribe(
     app: AppHandle,
     is_listening: Arc<Mutex<bool>>,
@@ -315,6 +315,7 @@ pub async fn capture_and_transcribe(
     speaker: &'static str,
     whisper: std::sync::Arc<transcriber::WhisperTranscriber>,
     engine: SttEngine,
+    language: crate::lang::Language,
     bleed: Option<BleedWindow>,
     aec: Option<AecEnd>,
 ) -> Result<()> {
@@ -323,6 +324,10 @@ pub async fn capture_and_transcribe(
     // engines.
     let _ = &bleed;
     let _ = &aec;
+    // `language` selects the on-device Parakeet finals in the streaming path only;
+    // bind it on non-sherpa builds where that path is compiled out.
+    #[cfg(not(feature = "sherpa"))]
+    let _ = language;
     let host = cpal::default_host();
 
     // Resolve the capture device + format. For Loopback we pick an OUTPUT device
@@ -424,6 +429,7 @@ pub async fn capture_and_transcribe(
             &is_listening,
             &metrics,
             speaker,
+            language,
             stt,
             &mut consumer,
             sample_rate,
@@ -569,6 +575,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
     is_listening: &Arc<Mutex<bool>>,
     metrics: &Arc<Metrics>,
     speaker: &'static str,
+    language: crate::lang::Language,
     stt: &'static crate::stt::StreamingStt,
     consumer: &mut C,
     sample_rate: u32,
@@ -577,6 +584,11 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
 ) {
     // Cap on the buffered utterance audio re-decoded by Parakeet on endpoint.
     const UTTERANCE_CAP: usize = WHISPER_SAMPLE_RATE as usize * 60;
+    // Spanish-only: utterances whose online hypothesis is this short (in words) skip
+    // the Canary offline final and keep the Kroko online hypothesis. Canary
+    // hallucinates a word on tiny isolated fragments ("funcionales" → "Mussales");
+    // the monolingual Kroko streaming model doesn't.
+    const SPANISH_SHORT_FINAL_WORDS: usize = 2;
     // Trailing no-token time after which the Parakeet second pass starts
     // speculatively — well before the endpointer's rule2 (0.9s), so the decode
     // runs INSIDE the confirmation window instead of after it. Measured from
@@ -715,7 +727,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
             && utterance_peak_rms >= rms_gate
             && segment_s - last_token_s >= SPECULATIVE_TRAILING_S
         {
-            if let Some(parakeet) = crate::stt::parakeet() {
+            if let Some(parakeet) = crate::stt::parakeet(language) {
                 let snapshot = utterance.clone();
                 speculative = Some(tokio::task::spawn_blocking(move || {
                     parakeet
@@ -747,10 +759,23 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
                 // the online hypothesis if Parakeet produced nothing.
                 let final_start = Instant::now();
                 let was_speculative = speculative.is_some();
-                let second_pass = match speculative.take() {
-                    Some(handle) => handle.await.ok().flatten(),
-                    None => {
-                        crate::stt::parakeet().and_then(|p| {
+                // On short Spanish fragments, skip the Canary offline final (it
+                // hallucinates without context) and keep the Kroko online hypothesis.
+                let short_fragment = language == crate::lang::Language::Spanish
+                    && streaming_text.split_whitespace().count() <= SPANISH_SHORT_FINAL_WORDS;
+                let second_pass = if short_fragment {
+                    // Any in-flight offline decode is discarded at the `speculative`
+                    // reset after this block; just don't await it here.
+                    tracing::debug!(
+                        speaker,
+                        text = %streaming_text,
+                        "short Spanish fragment — keeping Kroko online hypothesis over Canary"
+                    );
+                    None
+                } else {
+                    match speculative.take() {
+                        Some(handle) => handle.await.ok().flatten(),
+                        None => crate::stt::parakeet(language).and_then(|p| {
                             match p.transcribe(&utterance[..tail_start]) {
                                 Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
                                 Ok(_) => None,
@@ -759,7 +784,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
                                     None
                                 }
                             }
-                        })
+                        }),
                     }
                 };
                 let final_text = second_pass.unwrap_or(streaming_text);

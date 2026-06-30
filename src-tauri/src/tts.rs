@@ -15,11 +15,23 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::lang::Language;
+
 /// Neutral voice + interviewer tone for the `OpenAI` path.
 const OPENAI_VOICE: &str = "alloy";
-const OPENAI_INSTRUCTIONS: &str =
+const OPENAI_INSTRUCTIONS_EN: &str =
     "Speak like a calm, professional senior engineer conducting a technical \
      interview. Neutral American accent, clear and unhurried.";
+const OPENAI_INSTRUCTIONS_ES: &str =
+    "Hablá como un ingeniero senior tranquilo y profesional tomando una entrevista \
+     técnica. Español neutro, claro y sin apuro.";
+
+fn openai_instructions(language: Language) -> &'static str {
+    match language {
+        Language::English => OPENAI_INSTRUCTIONS_EN,
+        Language::Spanish => OPENAI_INSTRUCTIONS_ES,
+    }
+}
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -69,11 +81,11 @@ impl TtsEngine {
         }
     }
 
-    /// Synthesize `text`, save it as a WAV, and log a structured JSONL line.
-    /// Returns the outcome (provider + path) so the caller can play it.
-    pub async fn synthesize_and_save(&self, text: &str) -> Result<TtsOutcome> {
+    /// Synthesize `text` in `language`, save it as a WAV, and log a structured
+    /// JSONL line. Returns the outcome (provider + path) so the caller can play it.
+    pub async fn synthesize_and_save(&self, text: &str, language: Language) -> Result<TtsOutcome> {
         let t0 = Instant::now();
-        let (bytes, provider) = self.synthesize(text).await?;
+        let (bytes, provider) = self.synthesize(text, language).await?;
 
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let path = self.clips_dir.join(format!("{stamp}-{}.wav", slug(text)));
@@ -98,21 +110,27 @@ impl TtsEngine {
         })
     }
 
-    /// Try local Kokoro (if built), else `OpenAI`. Returns `(wav_bytes, provider)`.
-    async fn synthesize(&self, text: &str) -> Result<(Vec<u8>, String)> {
+    /// Try local Kokoro (English only, if built), else `OpenAI`. Returns
+    /// `(wav_bytes, provider)`. Kokoro ships no Spanish voices, so Spanish always
+    /// goes through `OpenAI`.
+    async fn synthesize(&self, text: &str, language: Language) -> Result<(Vec<u8>, String)> {
         #[cfg(feature = "sherpa")]
         {
-            match crate::stt::kokoro_tts(text) {
-                Ok(Some(bytes)) => return Ok((bytes, "kokoro".into())),
-                Ok(None) => tracing::debug!("kokoro model not present; using OpenAI TTS"),
-                Err(e) => tracing::warn!(error = %e, "kokoro TTS failed; falling back to OpenAI"),
+            if language == Language::English {
+                match crate::stt::kokoro_tts(text) {
+                    Ok(Some(bytes)) => return Ok((bytes, "kokoro".into())),
+                    Ok(None) => tracing::debug!("kokoro model not present; using OpenAI TTS"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "kokoro TTS failed; falling back to OpenAI");
+                    }
+                }
             }
         }
-        let bytes = self.openai_tts(text).await?;
+        let bytes = self.openai_tts(text, language).await?;
         Ok((bytes, "openai/gpt-4o-mini-tts".into()))
     }
 
-    async fn openai_tts(&self, text: &str) -> Result<Vec<u8>> {
+    async fn openai_tts(&self, text: &str, language: Language) -> Result<Vec<u8>> {
         let key = self
             .openai
             .as_ref()
@@ -122,7 +140,7 @@ impl TtsEngine {
             "voice": OPENAI_VOICE,
             "input": text,
             "response_format": "wav",
-            "instructions": OPENAI_INSTRUCTIONS,
+            "instructions": openai_instructions(language),
         });
         let resp = self
             .client
