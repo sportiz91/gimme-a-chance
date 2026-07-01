@@ -283,10 +283,15 @@ pub async fn ask_brain(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let brain = state
+        .brain_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
     let outcome = state
         .api
-        .ask(&question, &context, language, &trace_id, &app)
+        .ask(&question, &context, language, brain, &trace_id, &app)
         .await
         .map_err(|e| AppError::Llm(e.to_string()))?;
     metrics
@@ -352,6 +357,105 @@ pub fn get_language(state: tauri::State<'_, AppState>) -> Result<String, AppErro
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     Ok(language.tag().to_string())
+}
+
+/// Capture the primary monitor and describe it with the selected vision model.
+/// Streams `vision-delta` events; returns (and stores) the full description text.
+#[tauri::command]
+#[tracing::instrument(skip(state, app), fields(trace_id = trace_id.as_deref().unwrap_or("-")))]
+pub async fn capture_and_describe(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    trace_id: Option<String>,
+) -> Result<String, AppError> {
+    let trace_id = trace_id.unwrap_or_else(|| "-".into());
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let vision_model = state
+        .vision_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+
+    // xcap grabs synchronously — keep it off the async runtime.
+    let img = tauri::async_runtime::spawn_blocking(crate::capture::capture_primary_jpeg_base64)
+        .await
+        .map_err(|e| AppError::Vision(format!("capture task join: {e}")))?
+        .map_err(|e| AppError::Vision(e.to_string()))?;
+
+    let outcome = state
+        .api
+        .describe(&img, vision_model, language, &trace_id, &app)
+        .await
+        .map_err(|e| AppError::Vision(e.to_string()))?;
+
+    if let Ok(mut d) = state.last_description.lock() {
+        d.clone_from(&outcome.text);
+    }
+    state
+        .metrics
+        .last_vision_ms
+        .store(outcome.total_ms, Ordering::Relaxed);
+    Ok(outcome.text)
+}
+
+/// Switch the vision (screen-describing) model (`"gpt_4o_mini"` | `"gpt_5_5"`).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_vision_model(state: tauri::State<'_, AppState>, model: String) -> Result<(), AppError> {
+    let new_model = crate::backend::VisionModel::from_tag(&model)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown vision model: {model}")))?;
+    let mut guard = state
+        .vision_model
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    *guard = new_model;
+    tracing::info!(?new_model, "vision model switched");
+    Ok(())
+}
+
+/// Current vision model tag (for the UI to reflect on load).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn get_vision_model(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let m = state
+        .vision_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(m.tag().to_string())
+}
+
+/// Switch the brain (answering) model (`"auto"` | `"gpt_4o_mini"` | `"gpt_5_5"`).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_brain_model(state: tauri::State<'_, AppState>, model: String) -> Result<(), AppError> {
+    let new_model = crate::backend::BrainModel::from_tag(&model)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown brain model: {model}")))?;
+    let mut guard = state
+        .brain_model
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    *guard = new_model;
+    tracing::info!(?new_model, "brain model switched");
+    Ok(())
+}
+
+/// Current brain model tag (for the UI to reflect on load).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn get_brain_model(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let m = state
+        .brain_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(m.tag().to_string())
 }
 
 /// Structured log entry forwarded from the frontend so that JS timings

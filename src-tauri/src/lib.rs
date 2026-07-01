@@ -4,6 +4,7 @@ mod aec;
 mod alloc_counter;
 mod audio;
 mod backend;
+mod capture;
 mod cloud_stt;
 mod commands;
 mod crashlog;
@@ -86,6 +87,12 @@ pub struct AppState {
     pub metrics: Arc<metrics::Metrics>,
     /// Direct-API backend (Groq → `OpenAI` fallback chain). Built at startup.
     pub api: Arc<backend::ApiBackend>,
+    /// Vision model that describes screenshots. Toggled from the UI; default gpt-4o-mini.
+    pub vision_model: Arc<Mutex<backend::VisionModel>>,
+    /// Brain model that answers (later: a wired-in agent). Toggled from the UI; default Auto.
+    pub brain_model: Arc<Mutex<backend::BrainModel>>,
+    /// Latest screen description (for the future agent + debug). Overwritten each capture.
+    pub last_description: Arc<Mutex<String>>,
     /// Transcription + answer language. Toggled from the UI; default = English.
     /// Read at `start_listening` (STT engine) and `ask_brain` (prompt) time.
     pub language: Arc<Mutex<lang::Language>>,
@@ -107,6 +114,9 @@ impl Default for AppState {
             transcript: Arc::new(Mutex::new(String::new())),
             metrics: Arc::new(metrics::Metrics::default()),
             api: Arc::new(backend::ApiBackend::new()),
+            vision_model: Arc::new(Mutex::new(backend::VisionModel::default())),
+            brain_model: Arc::new(Mutex::new(backend::BrainModel::default())),
+            last_description: Arc::new(Mutex::new(String::new())),
             language: Arc::new(Mutex::new(lang::Language::default())),
             tts: Arc::new(tts::TtsEngine::new()),
             whisper: Arc::new(OnceLock::new()),
@@ -156,6 +166,8 @@ pub fn run() {
     // the dhat profiler drop properly and write their output. Killing via Ctrl+C
     // in the terminal would skip destructors.
     let quit_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyQ);
+    // Ctrl+Shift+S: capture the primary monitor and feed it to the vision model.
+    let capture_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
@@ -214,6 +226,9 @@ pub fn run() {
                                 tracing::error!(error = %e, "failed to close window");
                             }
                         }
+                    } else if shortcut == &capture_shortcut {
+                        tracing::debug!("capture shortcut pressed");
+                        _ = app.emit("trigger-capture", ());
                     }
                 })
                 .build(),
@@ -222,10 +237,12 @@ pub fn run() {
             app.global_shortcut().register(toggle_shortcut)?;
             app.global_shortcut().register(debug_shortcut)?;
             app.global_shortcut().register(quit_shortcut)?;
+            app.global_shortcut().register(capture_shortcut)?;
             tracing::info!(
                 window_toggle = "Ctrl+Shift+H",
                 debug_panel = "Ctrl+Shift+D",
                 quit = "Ctrl+Shift+Q",
+                capture = "Ctrl+Shift+S",
                 "global shortcuts registered"
             );
 
@@ -308,6 +325,11 @@ pub fn run() {
             commands::start_listening,
             commands::stop_listening,
             commands::ask_brain,
+            commands::capture_and_describe,
+            commands::set_vision_model,
+            commands::get_vision_model,
+            commands::set_brain_model,
+            commands::get_brain_model,
             commands::set_language,
             commands::get_language,
             commands::simulate_interviewer,

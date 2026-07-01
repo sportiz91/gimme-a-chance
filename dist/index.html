@@ -147,6 +147,35 @@
       animation: pulse 1s infinite;
     }
 
+    /* Vision area (screen description) */
+    #vision {
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 10px;
+      background: rgba(186, 104, 200, 0.08);
+      border-radius: 6px;
+      border: 1px solid rgba(186, 104, 200, 0.25);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    #vision:empty::after {
+      content: 'Screen description will appear here…';
+      opacity: 0.3;
+      font-style: italic;
+    }
+    #vision.capturing::after {
+      content: '📸 Capturing…';
+      opacity: 0.5;
+    }
+    #vision.describing::after {
+      content: '👁 Processing image…';
+      opacity: 0.5;
+      animation: pulse 1s infinite;
+    }
+    .spk-screen { color: #ba68c8; font-weight: 700; }
+
     /* Manual ask input */
     .ask-row {
       display: flex;
@@ -225,8 +254,24 @@
       </label>
     </div>
 
+    <div class="controls">
+      <select id="visionSelect" onchange="setVisionModel()" title="Vision model (describes the screen)" style="flex:0 0 auto; max-width:160px">
+        <option value="gpt_4o_mini">👁 gpt-4o-mini</option>
+        <option value="gpt_5_5">👁 gpt-5.5</option>
+      </select>
+      <select id="brainSelect" onchange="setBrainModel()" title="Brain model (answers)" style="flex:0 0 auto; max-width:190px">
+        <option value="auto">🧠 Auto (Groq→OpenAI)</option>
+        <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
+        <option value="gpt_5_5">🧠 gpt-5.5</option>
+      </select>
+      <button id="captureBtn" onclick="captureScreen()" title="Capture screen (Ctrl+Shift+S)">👁 Capture</button>
+    </div>
+
     <div class="section-label">Transcript</div>
     <div id="transcript"></div>
+
+    <div class="section-label">Vision</div>
+    <div id="vision"></div>
 
     <div class="section-label">Answer</div>
     <div id="response"></div>
@@ -260,6 +305,7 @@
     <div class="row"><span class="key">last STT</span><span class="val" id="dbgStt">—</span></div>
     <div class="row"><span class="key">last LLM total</span><span class="val" id="dbgLlm">—</span></div>
     <div class="row"><span class="key">last LLM TTFT</span><span class="val" id="dbgTtft">—</span></div>
+    <div class="row"><span class="key">last vision</span><span class="val" id="dbgVision">—</span></div>
     <div class="row"><span class="key">provider</span><span class="val" id="dbgProvider">—</span></div>
     <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
     <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
@@ -281,6 +327,7 @@
     // italic tail line that refines in place until the final replaces it.
     const partialLines = { me: '', interviewer: '' };
     let activeTraceId = null;   // the question currently being answered (for streaming)
+    let activeVisionTraceId = null; // the screen capture currently being described
     let firstDeltaSeen = false; // whether the active answer has painted its first token
     let lastAnsweredQ = '';     // normalized last question answered (dedup across the window)
     let lastTraceId = null;
@@ -379,6 +426,50 @@
       }
     }
 
+    // Vision & brain model selection (mirrors setLanguage / initLanguage).
+    async function setVisionModel() {
+      const model = document.getElementById('visionSelect').value;
+      try { await invoke('set_vision_model', { model }); log('info', 'vision_model_set', { model }); }
+      catch (e) { console.error('set_vision_model failed:', e); }
+    }
+    async function initVisionModel() {
+      try { document.getElementById('visionSelect').value = await invoke('get_vision_model'); }
+      catch (e) { console.error('get_vision_model failed:', e); }
+    }
+    async function setBrainModel() {
+      const model = document.getElementById('brainSelect').value;
+      try { await invoke('set_brain_model', { model }); log('info', 'brain_model_set', { model }); }
+      catch (e) { console.error('set_brain_model failed:', e); }
+    }
+    async function initBrainModel() {
+      try { document.getElementById('brainSelect').value = await invoke('get_brain_model'); }
+      catch (e) { console.error('get_brain_model failed:', e); }
+    }
+
+    // Manual screen capture → vision model describes it → text ingested into context.
+    async function captureScreen(traceId) {
+      const t = traceId || crypto.randomUUID();
+      activeVisionTraceId = t;
+      const el = document.getElementById('vision');
+      el.textContent = '';
+      el.className = 'describing';
+      log('info', 'capture_start', { trace_id: t });
+      try {
+        const desc = await invoke('capture_and_describe', { traceId: t });
+        el.className = '';
+        el.textContent = desc;
+        // Ingest the screen as another context source, alongside the audio transcript.
+        transcriptLines.push({ speaker: 'screen', text: desc });
+        if (transcriptLines.length > MAX_TRANSCRIPT_LINES) transcriptLines.shift();
+        renderTranscript();
+        log('info', 'capture_done', { trace_id: t, desc_len: desc.length });
+      } catch (e) {
+        el.className = '';
+        el.textContent = 'Error: ' + e;
+        log('error', 'capture_failed', { trace_id: t, error: String(e) });
+      }
+    }
+
     async function toggleListening() {
       const btn = document.getElementById('listenBtn');
       const dot = document.getElementById('statusDot');
@@ -432,7 +523,7 @@
 
       try {
         const context = transcriptLines
-          .map(l => (l.speaker === 'me' ? 'You' : 'Interviewer') + ': ' + l.text)
+          .map(l => (l.speaker === 'me' ? 'You' : l.speaker === 'screen' ? 'Screen' : 'Interviewer') + ': ' + l.text)
           .join('\n');
         const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
         const elapsed_ms = Math.round(performance.now() - t0);
@@ -471,12 +562,25 @@
       responseEl.scrollTop = responseEl.scrollHeight;
     });
 
+    // Stream the screen description token-by-token as the vision model produces it.
+    listen('vision-delta', (event) => {
+      const { trace_id, text } = event.payload;
+      if (trace_id !== activeVisionTraceId) return; // ignore stale deltas
+      const el = document.getElementById('vision');
+      el.className = '';
+      el.textContent += text;
+      el.scrollTop = el.scrollHeight;
+    });
+
+    // Ctrl+Shift+S from the backend (global hotkey) → capture the screen.
+    listen('trigger-capture', () => captureScreen());
+
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
     function speakerLabel(who) {
-      return who === 'me'
-        ? '<span class="spk-me">You:</span>'
-        : '<span class="spk-int">Interviewer:</span>';
+      if (who === 'me') return '<span class="spk-me">You:</span>';
+      if (who === 'screen') return '<span class="spk-screen">👁 Screen:</span>';
+      return '<span class="spk-int">Interviewer:</span>';
     }
 
     function renderTranscript() {
@@ -647,6 +751,7 @@
       document.getElementById('dbgStt').textContent = m.last_stt_ms ? m.last_stt_ms + ' ms' : '—';
       document.getElementById('dbgLlm').textContent = m.last_llm_ms ? m.last_llm_ms + ' ms' : '—';
       document.getElementById('dbgTtft').textContent = m.last_llm_ttft_ms ? m.last_llm_ttft_ms + ' ms' : '—';
+      document.getElementById('dbgVision').textContent = m.last_vision_ms ? m.last_vision_ms + ' ms' : '—';
       document.getElementById('dbgProvider').textContent = m.last_provider || '—';
       if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
 
@@ -676,6 +781,8 @@
     }
     loadDevices();
     initLanguage();
+    initVisionModel();
+    initBrainModel();
   </script>
 </body>
 </html>

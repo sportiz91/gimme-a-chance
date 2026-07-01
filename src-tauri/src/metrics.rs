@@ -28,6 +28,8 @@ pub struct Metrics {
     pub last_llm_ms: AtomicU64,
     /// Time-to-first-token of the last LLM turn (ms) — the "feels fast" metric.
     pub last_llm_ttft_ms: AtomicU64,
+    /// Total ms of the last vision (screen describe) turn.
+    pub last_vision_ms: AtomicU64,
     /// Which backend/provider answered the last turn (e.g. `groq/llama-3.1-8b-instant`).
     /// A `String`, so it lives behind a `Mutex` rather than an atomic.
     pub last_provider: Mutex<String>,
@@ -53,6 +55,7 @@ impl Default for Metrics {
             last_stt_ms: AtomicU64::new(0),
             last_llm_ms: AtomicU64::new(0),
             last_llm_ttft_ms: AtomicU64::new(0),
+            last_vision_ms: AtomicU64::new(0),
             last_provider: Mutex::new(String::new()),
             heap_live_bytes: AtomicU64::new(0),
             heap_total_allocated_bytes: AtomicU64::new(0),
@@ -84,6 +87,7 @@ impl Metrics {
             last_stt_ms: self.last_stt_ms.load(Ordering::Relaxed),
             last_llm_ms: self.last_llm_ms.load(Ordering::Relaxed),
             last_llm_ttft_ms: self.last_llm_ttft_ms.load(Ordering::Relaxed),
+            last_vision_ms: self.last_vision_ms.load(Ordering::Relaxed),
             last_provider: self
                 .last_provider
                 .lock()
@@ -158,6 +162,7 @@ pub struct MetricsSnapshot {
     pub last_stt_ms: u64,
     pub last_llm_ms: u64,
     pub last_llm_ttft_ms: u64,
+    pub last_vision_ms: u64,
     pub last_provider: String,
     pub heap_live_bytes: u64,
     pub heap_total_allocated_bytes: u64,

@@ -12,6 +12,9 @@ pub enum AppError {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    #[error("Vision error: {0}")]
+    Vision(String),
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

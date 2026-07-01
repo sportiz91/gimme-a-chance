@@ -22,6 +22,11 @@ tokio = { version = "1", features = ["full"] }
 # API mode: HTTP client (native-tls = schannel on Windows, no OpenSSL needed).
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = "0.3"
+# Vision feature: screen capture (xcap → DXGI Desktop Duplication on Windows),
+# in-memory resize + JPEG encode (image crate), and base64 for the data: URL.
+xcap = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"
 # Secrets: in-memory protection (SecretString) + at-rest OS keyring.
 secrecy = "0.8"
 keyring = { version = "3", features = ["windows-native"] }
