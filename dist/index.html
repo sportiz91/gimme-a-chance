@@ -122,7 +122,7 @@
     /* Live partial hypothesis from the streaming STT engine */
     .partial { opacity: 0.55; font-style: italic; }
 
-    /* Claude response area */
+    /* Answer area */
     #response {
       min-height: 100px;
       max-height: 400px;
@@ -137,7 +137,7 @@
       word-wrap: break-word;
     }
     #response:empty::after {
-      content: 'Claude response will appear here...';
+      content: 'Answer will appear here...';
       opacity: 0.3;
       font-style: italic;
     }
@@ -215,10 +215,6 @@
         <option value="both">🎙️+🔊 Both (interviewer + you)</option>
       </select>
       <select id="deviceSelect"></select>
-      <select id="modeSelect" onchange="setMode()" title="Answering backend" style="flex:0 0 auto; max-width:150px">
-        <option value="api">API (Groq→OpenAI)</option>
-        <option value="claude_code">Claude Code</option>
-      </select>
       <select id="langSelect" onchange="setLanguage()" title="Language (transcription + answers)" style="flex:0 0 auto; max-width:120px">
         <option value="english">English</option>
         <option value="spanish">Español</option>
@@ -232,12 +228,12 @@
     <div class="section-label">Transcript</div>
     <div id="transcript"></div>
 
-    <div class="section-label">Claude</div>
+    <div class="section-label">Answer</div>
     <div id="response"></div>
 
     <div class="ask-row">
-      <input id="askInput" type="text" placeholder="Ask Claude manually..." onkeydown="if(event.key==='Enter')askClaude()" />
-      <button onclick="askClaude()">Ask</button>
+      <input id="askInput" type="text" placeholder="Ask manually..." onkeydown="if(event.key==='Enter')askBrain()" />
+      <button onclick="askBrain()">Ask</button>
     </div>
 
     <div class="section-label">Simulate interviewer (test)</div>
@@ -262,12 +258,8 @@
     <div class="row"><span class="key">callback p99.9</span><span class="val" id="dbgP999">—</span></div>
     <div class="row"><span class="key">callback samples</span><span class="val" id="dbgSamples">—</span></div>
     <div class="row"><span class="key">last STT</span><span class="val" id="dbgStt">—</span></div>
-    <div class="row"><span class="key">last LLM spawn</span><span class="val" id="dbgLlmSpawn">—</span></div>
     <div class="row"><span class="key">last LLM total</span><span class="val" id="dbgLlm">—</span></div>
     <div class="row"><span class="key">last LLM TTFT</span><span class="val" id="dbgTtft">—</span></div>
-    <div class="row"><span class="key">cache read tok</span><span class="val" id="dbgCacheRead">—</span></div>
-    <div class="row"><span class="key">cache write tok</span><span class="val" id="dbgCacheWrite">—</span></div>
-    <div class="row"><span class="key">tool-use breaches</span><span class="val" id="dbgToolUse">—</span></div>
     <div class="row"><span class="key">provider</span><span class="val" id="dbgProvider">—</span></div>
     <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
     <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
@@ -362,25 +354,6 @@
       }
     }
 
-    async function setMode() {
-      const mode = document.getElementById('modeSelect').value;
-      try {
-        await invoke('set_mode', { mode });
-        log('info', 'mode_set', { mode });
-      } catch (e) {
-        console.error('set_mode failed:', e);
-      }
-    }
-
-    async function initMode() {
-      try {
-        const m = await invoke('get_mode');
-        document.getElementById('modeSelect').value = m;
-      } catch (e) {
-        console.error('get_mode failed:', e);
-      }
-    }
-
     async function setLanguage() {
       const language = document.getElementById('langSelect').value;
       currentLang = language;
@@ -438,7 +411,7 @@
       }
     }
 
-    async function askClaude(question, traceId) {
+    async function askBrain(question, traceId) {
       const input = document.getElementById('askInput');
       const q = question || input.value.trim();
       if (!q) return;
@@ -461,7 +434,7 @@
         const context = transcriptLines
           .map(l => (l.speaker === 'me' ? 'You' : 'Interviewer') + ': ' + l.text)
           .join('\n');
-        const answer = await invoke('ask_claude', { traceId: trace_id, question: q, context });
+        const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
         const elapsed_ms = Math.round(performance.now() - t0);
         responseEl.classList.remove('loading');
         responseEl.textContent = answer;
@@ -481,8 +454,8 @@
       }
     }
 
-    // Stream Claude's answer token-by-token as it arrives from the backend.
-    // The final full answer still comes back from the `ask_claude` invoke (which
+    // Stream the answer token-by-token as it arrives from the backend.
+    // The final full answer still comes back from the `ask_brain` invoke (which
     // reconciles `textContent`), but these deltas paint the first line in ~1s.
     listen('answer-delta', (event) => {
       const { trace_id, text } = event.payload;
@@ -560,7 +533,7 @@
         if (norm !== lastAnsweredQ) {
           lastAnsweredQ = norm;
           log('info', 'question_detected', { trace_id, question: q });
-          askClaude(q, trace_id);
+          askBrain(q, trace_id);
         }
       }
     });
@@ -672,17 +645,8 @@
       setCell('dbgP999', m.callback_p999_us, 1000, 5000);
       document.getElementById('dbgSamples').textContent = m.callback_samples || '—';
       document.getElementById('dbgStt').textContent = m.last_stt_ms ? m.last_stt_ms + ' ms' : '—';
-      document.getElementById('dbgLlmSpawn').textContent = m.last_llm_spawn_ms ? m.last_llm_spawn_ms + ' ms' : '—';
       document.getElementById('dbgLlm').textContent = m.last_llm_ms ? m.last_llm_ms + ' ms' : '—';
       document.getElementById('dbgTtft').textContent = m.last_llm_ttft_ms ? m.last_llm_ttft_ms + ' ms' : '—';
-      // cache_read > 0 ⇒ the prompt cache was warm on the last turn (the win).
-      const cacheReadEl = document.getElementById('dbgCacheRead');
-      cacheReadEl.textContent = m.last_llm_cache_read_tokens ? m.last_llm_cache_read_tokens.toLocaleString() : '0';
-      cacheReadEl.className = 'val ' + (m.last_llm_cache_read_tokens ? '' : 'warn');
-      document.getElementById('dbgCacheWrite').textContent = m.last_llm_cache_creation_tokens ? m.last_llm_cache_creation_tokens.toLocaleString() : '0';
-      const toolEl = document.getElementById('dbgToolUse');
-      toolEl.textContent = m.llm_tool_use_count || '0';
-      toolEl.className = 'val ' + (m.llm_tool_use_count ? 'bad' : '');
       document.getElementById('dbgProvider').textContent = m.last_provider || '—';
       if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
 
@@ -711,7 +675,6 @@
       document.getElementById('sourceSelect').value = savedSource;
     }
     loadDevices();
-    initMode();
     initLanguage();
   </script>
 </body>

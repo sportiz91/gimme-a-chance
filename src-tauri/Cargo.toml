@@ -2,7 +2,7 @@
 name = "gimme-a-chance"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time interview copilot powered by whisper-rs + Claude Code"
+description = "Real-time interview copilot powered by whisper-rs + OpenAI/Groq"
 
 [lib]
 name = "gimme_a_chance_lib"

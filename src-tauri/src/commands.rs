@@ -9,7 +9,6 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::audio;
-use crate::backend::Mode;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -270,7 +269,7 @@ fn set_provider(state: &tauri::State<'_, AppState>, provider: &str) {
 
 #[tauri::command]
 #[tracing::instrument(skip(state, app, context), fields(trace_id = trace_id.as_deref().unwrap_or("-"), question_len = question.len(), context_len = context.len()))]
-pub async fn ask_claude(
+pub async fn ask_brain(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     trace_id: Option<String>,
@@ -279,92 +278,25 @@ pub async fn ask_claude(
 ) -> Result<String, AppError> {
     let metrics = Arc::clone(&state.metrics);
     let trace_id = trace_id.unwrap_or_else(|| "-".into());
-    let mode = state
-        .mode
-        .lock()
-        .map(|g| *g)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     let language = state
         .language
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
-    match mode {
-        Mode::ClaudeCode => {
-            let session = state
-                .claude
-                .get()
-                .ok_or_else(|| AppError::Claude("claude session not ready yet".into()))?;
-            let outcome = session
-                .ask(&question, &context, language, &trace_id)
-                .await
-                .map_err(|e| AppError::Claude(e.to_string()))?;
-            metrics
-                .last_llm_ms
-                .store(outcome.total_ms, Ordering::Relaxed);
-            metrics
-                .last_llm_ttft_ms
-                .store(outcome.ttft_ms, Ordering::Relaxed);
-            metrics
-                .last_llm_cache_read_tokens
-                .store(outcome.cache_read_tokens, Ordering::Relaxed);
-            metrics
-                .last_llm_cache_creation_tokens
-                .store(outcome.cache_creation_tokens, Ordering::Relaxed);
-            metrics.last_llm_spawn_ms.store(0, Ordering::Relaxed);
-            if outcome.tool_use {
-                metrics.llm_tool_use_count.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(%trace_id, "model leaked a tool_use despite the no-tools guardrail");
-            }
-            set_provider(&state, "claude-code");
-            Ok(outcome.answer)
-        }
-        Mode::Api => {
-            let outcome = state
-                .api
-                .ask(&question, &context, language, &trace_id, &app)
-                .await
-                .map_err(|e| AppError::Claude(e.to_string()))?;
-            metrics
-                .last_llm_ms
-                .store(outcome.total_ms, Ordering::Relaxed);
-            metrics
-                .last_llm_ttft_ms
-                .store(outcome.ttft_ms, Ordering::Relaxed);
-            // API providers don't report prompt-cache tokens; reset the CLI-only stats.
-            metrics
-                .last_llm_cache_read_tokens
-                .store(0, Ordering::Relaxed);
-            metrics
-                .last_llm_cache_creation_tokens
-                .store(0, Ordering::Relaxed);
-            metrics.last_llm_spawn_ms.store(0, Ordering::Relaxed);
-            set_provider(&state, &outcome.provider);
-            Ok(outcome.answer)
-        }
-    }
-}
-
-/// Switch the answering mode at runtime (`"api"` or `"claude_code"`).
-// Tauri commands take `State` and deserialized args by value — that's the macro
-// contract, not a needless move.
-#[allow(clippy::needless_pass_by_value)]
-#[tauri::command]
-#[tracing::instrument(skip(state))]
-pub fn set_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<(), AppError> {
-    let new_mode = match mode.as_str() {
-        "api" => Mode::Api,
-        "claude_code" => Mode::ClaudeCode,
-        other => return Err(AppError::Other(anyhow::anyhow!("unknown mode: {other}"))),
-    };
-    let mut guard = state
-        .mode
-        .lock()
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    *guard = new_mode;
-    tracing::info!(?new_mode, "answering mode switched");
-    Ok(())
+    let outcome = state
+        .api
+        .ask(&question, &context, language, &trace_id, &app)
+        .await
+        .map_err(|e| AppError::Llm(e.to_string()))?;
+    metrics
+        .last_llm_ms
+        .store(outcome.total_ms, Ordering::Relaxed);
+    metrics
+        .last_llm_ttft_ms
+        .store(outcome.ttft_ms, Ordering::Relaxed);
+    set_provider(&state, &outcome.provider);
+    Ok(outcome.answer)
 }
 
 /// Generate an interviewer question with TTS (Kokoro→OpenAI), save it as a WAV,
@@ -390,21 +322,6 @@ pub async fn simulate_interviewer(
     crate::tts::play_file(&outcome.wav_path);
     tracing::info!(provider = %outcome.provider, gen_ms = outcome.gen_ms, "simulating interviewer");
     Ok(outcome.wav_path.to_string_lossy().into_owned())
-}
-
-/// Current answering mode as a string (for the UI to reflect on load).
-#[allow(clippy::needless_pass_by_value)]
-#[tauri::command]
-pub fn get_mode(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
-    let mode = state
-        .mode
-        .lock()
-        .map(|g| *g)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    Ok(match mode {
-        Mode::Api => "api".into(),
-        Mode::ClaudeCode => "claude_code".into(),
-    })
 }
 
 /// Switch the transcription + answer language at runtime (`"english"` or

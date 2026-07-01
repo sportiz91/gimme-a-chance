@@ -9,8 +9,8 @@ pub enum AppError {
     #[error("Transcription error: {0}")]
     Transcription(String),
 
-    #[error("Claude error: {0}")]
-    Claude(String),
+    #[error("LLM error: {0}")]
+    Llm(String),
 
     #[error("{0}")]
     Other(#[from] anyhow::Error),

@@ -26,17 +26,10 @@ pub struct Metrics {
     pub callback_p999_us: AtomicU64,
     pub last_stt_ms: AtomicU64,
     pub last_llm_ms: AtomicU64,
-    pub last_llm_spawn_ms: AtomicU64,
     /// Time-to-first-token of the last LLM turn (ms) — the "feels fast" metric.
     pub last_llm_ttft_ms: AtomicU64,
-    /// Prompt-cache tokens READ on the last turn. >0 ⇒ cache was warm.
-    pub last_llm_cache_read_tokens: AtomicU64,
-    /// Prompt-cache tokens WRITTEN on the last turn. >0 ⇒ cold prefix (warmup/heartbeat).
-    pub last_llm_cache_creation_tokens: AtomicU64,
-    /// Monotonic count of turns where the model leaked a `tool_use` (guardrail breach).
-    pub llm_tool_use_count: AtomicU64,
-    /// Which backend/provider answered the last turn (e.g. `groq/llama-3.1-8b-instant`
-    /// or `claude-code`). A `String`, so it lives behind a `Mutex` rather than an atomic.
+    /// Which backend/provider answered the last turn (e.g. `groq/llama-3.1-8b-instant`).
+    /// A `String`, so it lives behind a `Mutex` rather than an atomic.
     pub last_provider: Mutex<String>,
     // Heap fields are always present but only populated when `counting-alloc`
     // is active. When the feature is off they stay at 0 and the UI shows "—".
@@ -59,11 +52,7 @@ impl Default for Metrics {
             callback_p999_us: AtomicU64::new(0),
             last_stt_ms: AtomicU64::new(0),
             last_llm_ms: AtomicU64::new(0),
-            last_llm_spawn_ms: AtomicU64::new(0),
             last_llm_ttft_ms: AtomicU64::new(0),
-            last_llm_cache_read_tokens: AtomicU64::new(0),
-            last_llm_cache_creation_tokens: AtomicU64::new(0),
-            llm_tool_use_count: AtomicU64::new(0),
             last_provider: Mutex::new(String::new()),
             heap_live_bytes: AtomicU64::new(0),
             heap_total_allocated_bytes: AtomicU64::new(0),
@@ -94,13 +83,7 @@ impl Metrics {
             callback_p999_us: self.callback_p999_us.load(Ordering::Relaxed),
             last_stt_ms: self.last_stt_ms.load(Ordering::Relaxed),
             last_llm_ms: self.last_llm_ms.load(Ordering::Relaxed),
-            last_llm_spawn_ms: self.last_llm_spawn_ms.load(Ordering::Relaxed),
             last_llm_ttft_ms: self.last_llm_ttft_ms.load(Ordering::Relaxed),
-            last_llm_cache_read_tokens: self.last_llm_cache_read_tokens.load(Ordering::Relaxed),
-            last_llm_cache_creation_tokens: self
-                .last_llm_cache_creation_tokens
-                .load(Ordering::Relaxed),
-            llm_tool_use_count: self.llm_tool_use_count.load(Ordering::Relaxed),
             last_provider: self
                 .last_provider
                 .lock()
@@ -174,11 +157,7 @@ pub struct MetricsSnapshot {
     pub callback_p999_us: u64,
     pub last_stt_ms: u64,
     pub last_llm_ms: u64,
-    pub last_llm_spawn_ms: u64,
     pub last_llm_ttft_ms: u64,
-    pub last_llm_cache_read_tokens: u64,
-    pub last_llm_cache_creation_tokens: u64,
-    pub llm_tool_use_count: u64,
     pub last_provider: String,
     pub heap_live_bytes: u64,
     pub heap_total_allocated_bytes: u64,

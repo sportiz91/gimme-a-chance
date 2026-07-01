@@ -1,8 +1,4 @@
-//! Answering backends and the runtime mode switch.
-//!
-//! Two modes the user can toggle:
-//!   - [`Mode::ClaudeCode`] — the persistent Claude Code CLI session (`crate::claude`).
-//!   - [`Mode::Api`] — a direct HTTP fallback chain over `OpenAI`-compatible providers.
+//! Answering backend: a direct HTTP fallback chain over `OpenAI`-compatible providers.
 //!
 //! The API chain is ordered for speed-first with graceful degradation, so the
 //! copilot never goes silent mid-interview:
@@ -51,15 +47,7 @@ const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(4);
 /// Max idle between chunks AFTER the first token (a mid-stream stall).
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Which answering backend the app is currently using. Toggled from the UI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    ClaudeCode,
-    Api,
-}
-
-/// Result of one API turn (the Claude Code path uses `crate::claude::AskOutcome`).
+/// Result of one API turn.
 pub struct ApiOutcome {
     pub answer: String,
     pub ttft_ms: u64,
