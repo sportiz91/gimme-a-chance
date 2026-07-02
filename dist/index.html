@@ -174,8 +174,6 @@
       opacity: 0.5;
       animation: pulse 1s infinite;
     }
-    .spk-screen { color: #ba68c8; font-weight: 700; }
-
     /* Clipboard area (exact-text ingest — no OCR) */
     #clipboard {
       max-height: 120px;
@@ -194,7 +192,6 @@
       opacity: 0.3;
       font-style: italic;
     }
-    .spk-clip { color: #ffb74d; font-weight: 700; }
 
     /* Manual ask input */
     .ask-row {
@@ -287,7 +284,7 @@
       <button id="addShotBtn" onclick="addShot()" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
       <button id="describeBtn" onclick="describeQueue()" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
       <button id="clearQueueBtn" onclick="clearQueue()" title="Discard queued shots" style="display:none">🗑</button>
-      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Ingest every copy as context; Ctrl+Shift+V re-ingests the clipboard by hand">
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Ingest every copy as context; Ctrl+Shift+V copies the current selection and ingests it">
         <input type="checkbox" id="autoClip" onchange="setAutoClip()" checked> 📋 auto-clip
       </label>
     </div>
@@ -298,7 +295,10 @@
     <div class="section-label">Vision</div>
     <div id="vision"></div>
 
-    <div class="section-label">Clipboard</div>
+    <div class="section-label" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Clipboard</span>
+      <button onclick="clearClipboard()" title="Clear the clipboard box and drop its context" style="padding:0 6px;font-size:11px;line-height:18px">🗑</button>
+    </div>
     <div id="clipboard"></div>
 
     <div class="section-label">Answer</div>
@@ -350,7 +350,11 @@
     // Selected language ('english' | 'spanish'). Drives question detection below;
     // the backend reads its own copy (set via set_language) on each Listen/answer.
     let currentLang = 'english';
-    let transcriptLines = [];
+    // The rolling context store — every source the brain reads: audio lines
+    // ('me'/'interviewer'), screen descriptions ('screen'), clips ('clipboard').
+    // The Transcript box renders only the audio lines; screen/clipboard entries
+    // live here for the context and show in their own boxes.
+    let contextLines = [];
     // Streaming engine only: per-speaker partial hypothesis, rendered as a gray
     // italic tail line that refines in place until the final replaces it.
     const partialLines = { me: '', interviewer: '' };
@@ -361,7 +365,12 @@
     let lastTraceId = null;
     let lastTraceStart = 0;
     let lastE2eMs = 0;
-    const MAX_TRANSCRIPT_LINES = 20;
+    const MAX_CONTEXT_LINES = 20;
+
+    function pushContext(speaker, text) {
+      contextLines.push({ speaker, text });
+      if (contextLines.length > MAX_CONTEXT_LINES) contextLines.shift();
+    }
 
     // Fire-and-forget structured log to the backend so JS events land in the
     // same JSONL file as Rust logs (unified trace timeline).
@@ -524,10 +533,8 @@
         el.className = '';
         el.textContent = desc;
         queueCount = 0;
-        // Ingest the screen as another context source, alongside the audio transcript.
-        transcriptLines.push({ speaker: 'screen', text: desc });
-        if (transcriptLines.length > MAX_TRANSCRIPT_LINES) transcriptLines.shift();
-        renderTranscript();
+        // Into the context store, alongside the audio (shown here, not in Transcript).
+        pushContext('screen', desc);
         log('info', 'describe_done', { trace_id: t, desc_len: desc.length });
       } catch (e) {
         el.className = '';
@@ -546,24 +553,36 @@
 
     // Clipboard ingestion — the exact-text source (no OCR). Auto path: the
     // backend watcher emits `clipboard-text` on every copy while auto-clip is
-    // on. Manual path (Ctrl+Shift+V): re-reads the clipboard unconditionally.
+    // on. Manual path (Ctrl+Shift+V): the backend copies the current selection
+    // (synthetic Ctrl+C on the focused app) and ingests the result.
     function paintClip(text) {
       const el = document.getElementById('clipboard');
       el.textContent = text;
       el.scrollTop = el.scrollHeight;
-      transcriptLines.push({ speaker: 'clipboard', text });
-      if (transcriptLines.length > MAX_TRANSCRIPT_LINES) transcriptLines.shift();
-      renderTranscript();
+      pushContext('clipboard', text);
     }
 
     async function ingestClipboard() {
       try {
-        const text = await invoke('ingest_clipboard');
+        const text = await invoke('copy_and_ingest');
         paintClip(text);
         log('info', 'clipboard_ingested', { manual: true, chars: text.length });
       } catch (e) {
         document.getElementById('clipboard').textContent = 'Error: ' + e;
         log('error', 'clipboard_ingest_failed', { error: String(e) });
+      }
+    }
+
+    // 🗑 clears the box AND the clip entries in the context store; the backend
+    // also forgets its dedup so re-copying the same text ingests again.
+    async function clearClipboard() {
+      document.getElementById('clipboard').textContent = '';
+      contextLines = contextLines.filter(l => l.speaker !== 'clipboard');
+      try {
+        await invoke('clear_clipboard');
+        log('info', 'clipboard_cleared', {});
+      } catch (e) {
+        log('error', 'clipboard_clear_failed', { error: String(e) });
       }
     }
 
@@ -641,7 +660,7 @@
 
       try {
         const SOURCE = { me: 'You', screen: 'Screen', clipboard: 'Clipboard' };
-        const context = transcriptLines
+        const context = contextLines
           .map(l => (SOURCE[l.speaker] || 'Interviewer') + ': ' + l.text)
           .join('\n');
         const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
@@ -699,14 +718,17 @@
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
     function speakerLabel(who) {
-      if (who === 'me') return '<span class="spk-me">You:</span>';
-      if (who === 'screen') return '<span class="spk-screen">👁 Screen:</span>';
-      if (who === 'clipboard') return '<span class="spk-clip">📋 Clipboard:</span>';
-      return '<span class="spk-int">Interviewer:</span>';
+      return who === 'me'
+        ? '<span class="spk-me">You:</span>'
+        : '<span class="spk-int">Interviewer:</span>';
     }
 
+    // The Transcript box is audio-only; screen/clipboard context lives in its
+    // own boxes (and still reaches the brain via contextLines).
     function renderTranscript() {
-      const lines = transcriptLines.map(l => speakerLabel(l.speaker) + ' ' + escapeHtml(l.text));
+      const lines = contextLines
+        .filter(l => l.speaker === 'me' || l.speaker === 'interviewer')
+        .map(l => speakerLabel(l.speaker) + ' ' + escapeHtml(l.text));
       for (const who of ['interviewer', 'me']) {
         if (partialLines[who]) {
           lines.push('<span class="partial">' + speakerLabel(who) + ' ' + escapeHtml(partialLines[who]) + '</span>');
@@ -733,10 +755,7 @@
       lastTraceId = trace_id;
       lastTraceStart = performance.now();
       partialLines[who] = '';
-      transcriptLines.push({ speaker: who, text });
-      if (transcriptLines.length > MAX_TRANSCRIPT_LINES) {
-        transcriptLines.shift();
-      }
+      pushContext(who, text);
       renderTranscript();
 
       log('info', 'transcription_received', { trace_id, speaker: who, text_len: text.length });
@@ -748,7 +767,7 @@
 
       // Detect over a 2-chunk window of THIS speaker's lines so questions split
       // across chunk boundaries are still caught. Dedup against the last answered.
-      const win = transcriptLines
+      const win = contextLines
         .filter(l => l.speaker === who)
         .slice(-2)
         .map(l => l.text)

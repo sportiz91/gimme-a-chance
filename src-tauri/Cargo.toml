@@ -32,6 +32,9 @@ base64 = "0.22"
 # events (AddClipboardFormatListener on Windows, not polling) for auto-clip.
 arboard = { version = "3", default-features = false }
 clipboard-master = "4"
+# Ctrl+Shift+V simulates Ctrl+C on the focused app (SendInput) before ingesting,
+# so one hotkey turns the current selection into context.
+enigo = "0.6"
 # Secrets: in-memory protection (SecretString) + at-rest OS keyring.
 secrecy = "0.8"
 keyring = { version = "3", features = ["windows-native"] }

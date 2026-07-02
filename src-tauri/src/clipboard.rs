@@ -7,14 +7,18 @@
 //! - **Auto-clip**: an OS clipboard listener (clipboard-master — event-driven,
 //!   no polling) fires on every copy. While the toggle is on, text that differs
 //!   from the last ingested clip is emitted as a `clipboard-text` event.
-//! - **Manual** (Ctrl+Shift+V → `ingest_clipboard` command): re-reads the
-//!   current clipboard unconditionally — the "force re-ingest" path.
+//! - **Manual** (Ctrl+Shift+V → `copy_and_ingest` command): simulates Ctrl+C on
+//!   the focused app, then ingests the resulting clipboard — one hotkey turns
+//!   the current selection into context. The watcher is suppressed while the
+//!   synthetic copy is in flight so the clip isn't ingested twice.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use tauri::{AppHandle, Emitter};
 
 /// Ingest cap. Interview-sized code and statements are a few KB; a stray
@@ -34,7 +38,7 @@ pub fn read_text() -> Result<String> {
     let mut last_err = anyhow!("clipboard read failed");
     for attempt in 0..3 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
         }
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => return Ok(cap(text.trim())),
@@ -42,6 +46,27 @@ pub fn read_text() -> Result<String> {
         }
     }
     Err(last_err)
+}
+
+/// Simulate Ctrl+C on the focused app, wait for it to publish the copy, then
+/// read the clipboard. The hotkey chord (Ctrl+Shift+V) may still be physically
+/// held when this runs — a leaked Shift would turn the copy into Ctrl+Shift+C
+/// (`DevTools` in browsers), so Shift is synthetically released first (a no-op
+/// if the user already let go). Blocking — call off the runtime.
+pub fn copy_selection_and_read() -> Result<String> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init: {e}"))?;
+    // A beat for the user's fingers to leave the chord before we synthesize.
+    std::thread::sleep(Duration::from_millis(120));
+    (|| {
+        enigo.key(Key::Shift, Direction::Release)?;
+        enigo.key(Key::Control, Direction::Press)?;
+        enigo.key(Key::Unicode('c'), Direction::Click)?;
+        enigo.key(Key::Control, Direction::Release)
+    })()
+    .map_err(|e| anyhow!("synthetic Ctrl+C: {e}"))?;
+    // Let the target app write the clipboard before reading it.
+    std::thread::sleep(Duration::from_millis(150));
+    read_text()
 }
 
 fn cap(s: &str) -> String {
@@ -55,12 +80,15 @@ fn cap(s: &str) -> String {
 struct Watcher {
     app: AppHandle,
     enabled: Arc<AtomicBool>,
+    /// True while a manual `copy_and_ingest` is in flight — its synthetic copy
+    /// fires this watcher too, and the manual path already ingests the text.
+    suppress: Arc<AtomicBool>,
     last_clip: Arc<Mutex<String>>,
 }
 
 impl ClipboardHandler for Watcher {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        if !self.enabled.load(Ordering::Relaxed) {
+        if self.suppress.load(Ordering::Relaxed) || !self.enabled.load(Ordering::Relaxed) {
             return CallbackResult::Next;
         }
         match read_text() {
@@ -91,11 +119,17 @@ impl ClipboardHandler for Watcher {
 
 /// Spawn the OS clipboard listener on its own thread (clipboard-master runs a
 /// blocking message loop). Lives for the whole app.
-pub fn spawn_watcher(app: AppHandle, enabled: Arc<AtomicBool>, last_clip: Arc<Mutex<String>>) {
+pub fn spawn_watcher(
+    app: AppHandle,
+    enabled: Arc<AtomicBool>,
+    suppress: Arc<AtomicBool>,
+    last_clip: Arc<Mutex<String>>,
+) {
     std::thread::spawn(move || {
         let watcher = Watcher {
             app,
             enabled,
+            suppress,
             last_clip,
         };
         match Master::new(watcher) {

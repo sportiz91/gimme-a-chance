@@ -101,6 +101,9 @@ pub struct AppState {
     /// Auto-clip: when true (the default), every OS copy is ingested as context.
     /// The UI checkbox is the off switch for noisy copy-paste sessions.
     pub auto_clip: Arc<AtomicBool>,
+    /// True while `copy_and_ingest`'s synthetic Ctrl+C is in flight — tells the
+    /// clipboard watcher to skip that change (the manual path ingests it).
+    pub manual_copy: Arc<AtomicBool>,
     /// Last ingested clip — dedup for the auto watcher (manual updates it too).
     pub last_clip: Arc<Mutex<String>>,
     /// Transcription + answer language. Toggled from the UI; default = English.
@@ -129,6 +132,7 @@ impl Default for AppState {
             last_description: Arc::new(Mutex::new(String::new())),
             capture_queue: Arc::new(Mutex::new(Vec::new())),
             auto_clip: Arc::new(AtomicBool::new(true)),
+            manual_copy: Arc::new(AtomicBool::new(false)),
             last_clip: Arc::new(Mutex::new(String::new())),
             language: Arc::new(Mutex::new(lang::Language::default())),
             tts: Arc::new(tts::TtsEngine::new()),
@@ -193,6 +197,7 @@ pub fn run() {
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
     let whisper_cell = Arc::clone(&app_state.whisper);
     let auto_clip = Arc::clone(&app_state.auto_clip);
+    let manual_copy = Arc::clone(&app_state.manual_copy);
     let last_clip = Arc::clone(&app_state.last_clip);
 
     // Preload the whisper model at startup (off the main thread) so the first
@@ -289,7 +294,7 @@ pub fn run() {
 
             // OS clipboard listener for auto-clip — its own thread; the message
             // loop blocks for the app's lifetime.
-            clipboard::spawn_watcher(app.handle().clone(), auto_clip, last_clip);
+            clipboard::spawn_watcher(app.handle().clone(), auto_clip, manual_copy, last_clip);
 
             // Periodic metrics emitter: every 2s push a snapshot to the frontend
             // so the debug panel can refresh without polling. `setup` runs before
@@ -374,7 +379,8 @@ pub fn run() {
             commands::describe_queue,
             commands::clear_capture_queue,
             commands::capture_queue_len,
-            commands::ingest_clipboard,
+            commands::copy_and_ingest,
+            commands::clear_clipboard,
             commands::set_auto_clip,
             commands::set_vision_model,
             commands::get_vision_model,

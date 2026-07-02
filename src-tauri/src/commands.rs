@@ -542,24 +542,47 @@ pub fn get_brain_model(state: tauri::State<'_, AppState>) -> Result<String, AppE
     Ok(m.tag().to_string())
 }
 
-/// Read the current clipboard text and ingest it (Ctrl+Shift+V, the manual
-/// path). No dedup — re-ingesting the same clip on purpose must work — but it
-/// updates the auto-clip dedup state so the watcher doesn't double-ingest.
+/// Copy the current selection (synthetic Ctrl+C to the focused app) and ingest
+/// the resulting clipboard text (Ctrl+Shift+V, the manual path). The watcher is
+/// suppressed for the duration so the copy isn't ingested twice; no dedup —
+/// re-ingesting the same clip on purpose must work — but the dedup state is
+/// updated so a later auto-clip of the same text stays quiet.
 #[tauri::command]
 #[tracing::instrument(skip(state))]
-pub async fn ingest_clipboard(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
-    let text = tauri::async_runtime::spawn_blocking(crate::clipboard::read_text)
-        .await
+pub async fn copy_and_ingest(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    state.manual_copy.store(true, Ordering::SeqCst);
+    let result =
+        tauri::async_runtime::spawn_blocking(crate::clipboard::copy_selection_and_read).await;
+    state.manual_copy.store(false, Ordering::SeqCst);
+    let text = result
         .map_err(|e| AppError::Clipboard(format!("clipboard task join: {e}")))?
         .map_err(|e| AppError::Clipboard(e.to_string()))?;
     if text.is_empty() {
-        return Err(AppError::Clipboard("clipboard has no text".into()));
+        return Err(AppError::Clipboard(
+            "nothing selected (clipboard has no text)".into(),
+        ));
     }
     if let Ok(mut last) = state.last_clip.lock() {
         last.clone_from(&text);
     }
-    tracing::info!(chars = text.len(), "clipboard ingested (manual)");
+    tracing::info!(chars = text.len(), "clipboard ingested (manual copy)");
     Ok(text)
+}
+
+/// Forget the last ingested clip (the Clipboard 🗑 button). The frontend drops
+/// the clip from its box and context; resetting the dedup here lets the same
+/// text be copied and ingested again afterwards.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn clear_clipboard(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let mut last = state
+        .last_clip
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    last.clear();
+    tracing::info!("clipboard context cleared");
+    Ok(())
 }
 
 /// Toggle the auto-clip monitor (ingest every OS copy) — the UI checkbox.
