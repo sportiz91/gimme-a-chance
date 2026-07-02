@@ -431,6 +431,9 @@ pub async fn describe_queue(
         imgs.push(capture_screen_blocking().await?);
     }
 
+    #[cfg(debug_assertions)]
+    dump_captures(&trace_id, &imgs);
+
     let outcome = match state
         .api
         .describe(&imgs, vision_model, language, &trace_id, &app)
@@ -457,6 +460,26 @@ pub async fn describe_queue(
         .last_vision_ms
         .store(outcome.total_ms, Ordering::Relaxed);
     Ok(outcome.text)
+}
+
+/// Debug builds only: persist the exact shots sent to a describe under
+/// `logs/captures/`, so a refusal can be reproduced offline against the API
+/// with the very same images.
+#[cfg(debug_assertions)]
+fn dump_captures(trace_id: &str, imgs: &[String]) {
+    use base64::Engine;
+    let dir = crate::telemetry::logs_dir().join("captures");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for (i, b64) in imgs.iter().enumerate() {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+            let path = dir.join(format!("{trace_id}-{i}.jpg"));
+            if std::fs::write(&path, bytes).is_ok() {
+                tracing::info!(path = %path.display(), "capture dumped (debug build)");
+            }
+        }
+    }
 }
 
 /// Drop all queued screenshots (the 🗑 button).

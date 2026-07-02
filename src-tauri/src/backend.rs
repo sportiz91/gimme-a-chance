@@ -444,6 +444,16 @@ impl ApiBackend {
             VISION_FIRST_TOKEN_TIMEOUT,
         )
         .await?;
+        // A refusal streams back as a normal, tiny completion — flag it loudly
+        // so log analysis doesn't mistake it for a nearly-empty screen.
+        let lower = text.to_lowercase();
+        if text.len() < 200
+            && ["no puedo", "lo siento", "i can't", "i cannot", "sorry"]
+                .iter()
+                .any(|m| lower.contains(m))
+        {
+            tracing::warn!(chars = text.len(), text = %text, "vision describe looks like a REFUSAL");
+        }
         tracing::info!(
             model = model.model_id(),
             shots = imgs.len(),
