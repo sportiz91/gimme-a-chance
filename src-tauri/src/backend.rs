@@ -75,10 +75,33 @@ fn vision_system(language: Language) -> &'static str {
     }
 }
 
-fn vision_instruction(language: Language) -> &'static str {
+// With several shots the user scrolled a long page: the shots are ordered
+// top-to-bottom and adjacent ones overlap, so the model must stitch, not repeat.
+fn vision_instruction(language: Language, shots: usize) -> String {
     match language {
-        Language::English => "Describe the screen for the interview context.",
-        Language::Spanish => "Describí la pantalla para el contexto de la entrevista.",
+        Language::English => {
+            if shots <= 1 {
+                "Describe the screen for the interview context.".into()
+            } else {
+                format!(
+                    "These {shots} screenshots are consecutive scrolls (top to bottom) of the \
+                     SAME page; adjacent shots may overlap. Reconstruct the complete content \
+                     once, in reading order, without repeating the overlapping parts."
+                )
+            }
+        }
+        Language::Spanish => {
+            if shots <= 1 {
+                "Describí la pantalla para el contexto de la entrevista.".into()
+            } else {
+                format!(
+                    "Estas {shots} capturas son scrolls consecutivos (de arriba hacia abajo) de \
+                     la MISMA página; capturas adyacentes pueden solaparse. Reconstruí el \
+                     contenido completo una sola vez, en orden de lectura, sin repetir lo \
+                     solapado."
+                )
+            }
+        }
     }
 }
 
@@ -355,12 +378,13 @@ impl ApiBackend {
         })
     }
 
-    /// Describe a screenshot (base64 JPEG, no `data:` prefix) as text, streaming
-    /// `vision-delta` events. Vision always goes through `OpenAI` — the only
-    /// vision-capable provider wired in.
+    /// Describe screenshots (base64 JPEGs, no `data:` prefix) as text, streaming
+    /// `vision-delta` events. Several shots go in ONE multimodal message — they
+    /// are consecutive scrolls of the same page, reconstructed in order. Vision
+    /// always goes through `OpenAI` — the only vision-capable provider wired in.
     pub async fn describe(
         &self,
-        img_b64_jpeg: &str,
+        imgs: &[String],
         model: VisionModel,
         language: Language,
         trace_id: &str,
@@ -370,13 +394,20 @@ impl ApiBackend {
             .openai
             .as_ref()
             .ok_or_else(|| anyhow!("vision needs OPENAI_API_KEY (not set)"))?;
-        let content = json!([
-            {"type": "text", "text": vision_instruction(language)},
-            {"type": "image_url", "image_url": {
-                "url": format!("data:image/jpeg;base64,{img_b64_jpeg}"),
+        if imgs.is_empty() {
+            bail!("no screenshots to describe");
+        }
+        let mut parts = vec![json!({
+            "type": "text",
+            "text": vision_instruction(language, imgs.len()),
+        })];
+        for img in imgs {
+            parts.push(json!({"type": "image_url", "image_url": {
+                "url": format!("data:image/jpeg;base64,{img}"),
                 "detail": "high",
-            }},
-        ]);
+            }}));
+        }
+        let content = Value::from(parts);
         let body = chat_body(
             model.model_id(),
             vision_system(language),
@@ -407,6 +438,7 @@ impl ApiBackend {
         .await?;
         tracing::info!(
             model = model.model_id(),
+            shots = imgs.len(),
             ttft_ms,
             total_ms,
             chars = text.len(),

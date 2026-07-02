@@ -264,7 +264,9 @@
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
       </select>
-      <button id="captureBtn" onclick="captureScreen()" title="Capture screen (Ctrl+Shift+S)">👁 Capture</button>
+      <button id="addShotBtn" onclick="addShot()" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
+      <button id="describeBtn" onclick="describeQueue()" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
+      <button id="clearQueueBtn" onclick="clearQueue()" title="Discard queued shots" style="display:none">🗑</button>
     </div>
 
     <div class="section-label">Transcript</div>
@@ -446,28 +448,74 @@
       catch (e) { console.error('get_brain_model failed:', e); }
     }
 
-    // Manual screen capture → vision model describes it → text ingested into context.
-    async function captureScreen(traceId) {
+    // Screenshot queue: Ctrl+Shift+Enter stacks captures (scroll a long page
+    // between presses), Ctrl+Shift+1 describes them all in ONE vision call.
+    // With nothing queued, Describe captures the current screen and describes
+    // it — the one-key path for a page that fits on screen.
+    let queueCount = 0;
+
+    function renderQueueBadge() {
+      document.getElementById('describeBtn').textContent =
+        queueCount > 0 ? `👁 Describe (${queueCount})` : '👁 Describe';
+      document.getElementById('clearQueueBtn').style.display = queueCount > 0 ? '' : 'none';
+    }
+
+    async function addShot() {
+      try {
+        queueCount = await invoke('queue_capture');
+        log('info', 'shot_queued', { queued: queueCount });
+      } catch (e) {
+        const el = document.getElementById('vision');
+        el.className = '';
+        el.textContent = 'Error: ' + e;
+        log('error', 'queue_capture_failed', { error: String(e) });
+      }
+      renderQueueBadge();
+    }
+
+    async function clearQueue() {
+      try {
+        await invoke('clear_capture_queue');
+        queueCount = 0;
+        log('info', 'queue_cleared', {});
+      } catch (e) {
+        log('error', 'clear_queue_failed', { error: String(e) });
+      }
+      renderQueueBadge();
+    }
+
+    // Describe the queue (or capture+describe when empty) → vision model → text
+    // ingested into context as a 'screen' source.
+    async function describeQueue(traceId) {
       const t = traceId || crypto.randomUUID();
       activeVisionTraceId = t;
       const el = document.getElementById('vision');
       el.textContent = '';
       el.className = 'describing';
-      log('info', 'capture_start', { trace_id: t });
+      log('info', 'describe_start', { trace_id: t, queued: queueCount });
       try {
-        const desc = await invoke('capture_and_describe', { traceId: t });
+        const desc = await invoke('describe_queue', { traceId: t });
         el.className = '';
         el.textContent = desc;
+        queueCount = 0;
         // Ingest the screen as another context source, alongside the audio transcript.
         transcriptLines.push({ speaker: 'screen', text: desc });
         if (transcriptLines.length > MAX_TRANSCRIPT_LINES) transcriptLines.shift();
         renderTranscript();
-        log('info', 'capture_done', { trace_id: t, desc_len: desc.length });
+        log('info', 'describe_done', { trace_id: t, desc_len: desc.length });
       } catch (e) {
         el.className = '';
         el.textContent = 'Error: ' + e;
-        log('error', 'capture_failed', { trace_id: t, error: String(e) });
+        // A failed describe puts the shots back on the backend queue — re-sync.
+        try { queueCount = await invoke('capture_queue_len'); } catch {}
+        log('error', 'describe_failed', { trace_id: t, error: String(e) });
       }
+      renderQueueBadge();
+    }
+
+    async function initQueue() {
+      try { queueCount = await invoke('capture_queue_len'); } catch {}
+      renderQueueBadge();
     }
 
     async function toggleListening() {
@@ -572,8 +620,9 @@
       el.scrollTop = el.scrollHeight;
     });
 
-    // Ctrl+Shift+S from the backend (global hotkey) → capture the screen.
-    listen('trigger-capture', () => captureScreen());
+    // Global hotkeys, relayed by the backend.
+    listen('trigger-queue-capture', () => addShot());
+    listen('trigger-describe-queue', () => describeQueue());
 
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
@@ -783,6 +832,7 @@
     initLanguage();
     initVisionModel();
     initBrainModel();
+    initQueue();
   </script>
 </body>
 </html>

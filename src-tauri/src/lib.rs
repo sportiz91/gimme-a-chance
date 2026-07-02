@@ -93,6 +93,9 @@ pub struct AppState {
     pub brain_model: Arc<Mutex<backend::BrainModel>>,
     /// Latest screen description (for the future agent + debug). Overwritten each capture.
     pub last_description: Arc<Mutex<String>>,
+    /// Screenshots queued for a multi-shot describe (base64 JPEGs, in capture
+    /// order = the user's top-to-bottom scroll order).
+    pub capture_queue: Arc<Mutex<Vec<String>>>,
     /// Transcription + answer language. Toggled from the UI; default = English.
     /// Read at `start_listening` (STT engine) and `ask_brain` (prompt) time.
     pub language: Arc<Mutex<lang::Language>>,
@@ -117,6 +120,7 @@ impl Default for AppState {
             vision_model: Arc::new(Mutex::new(backend::VisionModel::default())),
             brain_model: Arc::new(Mutex::new(backend::BrainModel::default())),
             last_description: Arc::new(Mutex::new(String::new())),
+            capture_queue: Arc::new(Mutex::new(Vec::new())),
             language: Arc::new(Mutex::new(lang::Language::default())),
             tts: Arc::new(tts::TtsEngine::new()),
             whisper: Arc::new(OnceLock::new()),
@@ -166,8 +170,12 @@ pub fn run() {
     // the dhat profiler drop properly and write their output. Killing via Ctrl+C
     // in the terminal would skip destructors.
     let quit_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyQ);
-    // Ctrl+Shift+S: capture the primary monitor and feed it to the vision model.
-    let capture_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+    // Screenshot queue (same bindings as screen-peek): Ctrl+Shift+Enter queues a
+    // capture of the current screen; Ctrl+Shift+1 describes the whole queue in
+    // one vision call (or captures+describes in one go when the queue is empty).
+    let queue_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Enter);
+    let describe_shortcut =
+        Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Digit1);
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
@@ -226,9 +234,12 @@ pub fn run() {
                                 tracing::error!(error = %e, "failed to close window");
                             }
                         }
-                    } else if shortcut == &capture_shortcut {
-                        tracing::debug!("capture shortcut pressed");
-                        _ = app.emit("trigger-capture", ());
+                    } else if shortcut == &queue_shortcut {
+                        tracing::debug!("queue-capture shortcut pressed");
+                        _ = app.emit("trigger-queue-capture", ());
+                    } else if shortcut == &describe_shortcut {
+                        tracing::debug!("describe-queue shortcut pressed");
+                        _ = app.emit("trigger-describe-queue", ());
                     }
                 })
                 .build(),
@@ -237,12 +248,23 @@ pub fn run() {
             app.global_shortcut().register(toggle_shortcut)?;
             app.global_shortcut().register(debug_shortcut)?;
             app.global_shortcut().register(quit_shortcut)?;
-            app.global_shortcut().register(capture_shortcut)?;
+            // The queue/describe bindings are shared with screen-peek; if that
+            // overlay is running it owns them, so a failed registration must not
+            // kill the app — warn and leave the UI buttons as the fallback.
+            for (label, sc) in [
+                ("Ctrl+Shift+Enter", queue_shortcut),
+                ("Ctrl+Shift+1", describe_shortcut),
+            ] {
+                if let Err(e) = app.global_shortcut().register(sc) {
+                    tracing::warn!(shortcut = label, error = %e, "shortcut registration failed (held by another app?)");
+                }
+            }
             tracing::info!(
                 window_toggle = "Ctrl+Shift+H",
                 debug_panel = "Ctrl+Shift+D",
                 quit = "Ctrl+Shift+Q",
-                capture = "Ctrl+Shift+S",
+                queue_capture = "Ctrl+Shift+Enter",
+                describe_queue = "Ctrl+Shift+1",
                 "global shortcuts registered"
             );
 
@@ -325,7 +347,10 @@ pub fn run() {
             commands::start_listening,
             commands::stop_listening,
             commands::ask_brain,
-            commands::capture_and_describe,
+            commands::queue_capture,
+            commands::describe_queue,
+            commands::clear_capture_queue,
+            commands::capture_queue_len,
             commands::set_vision_model,
             commands::get_vision_model,
             commands::set_brain_model,

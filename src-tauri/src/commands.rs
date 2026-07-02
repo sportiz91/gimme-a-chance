@@ -359,11 +359,51 @@ pub fn get_language(state: tauri::State<'_, AppState>) -> Result<String, AppErro
     Ok(language.tag().to_string())
 }
 
-/// Capture the primary monitor and describe it with the selected vision model.
-/// Streams `vision-delta` events; returns (and stores) the full description text.
+/// Cap on queued screenshots. Ten covers a very long page; past that the user
+/// almost certainly forgot the queue was filling up.
+const MAX_QUEUED_SHOTS: usize = 10;
+
+/// Capture the primary monitor off the async runtime (xcap grabs synchronously).
+async fn capture_screen_blocking() -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(crate::capture::capture_primary_jpeg_base64)
+        .await
+        .map_err(|e| AppError::Vision(format!("capture task join: {e}")))?
+        .map_err(|e| AppError::Vision(e.to_string()))
+}
+
+/// Capture the primary monitor onto the screenshot queue (Ctrl+Shift+Enter),
+/// for a later multi-shot describe. Returns the queue length (the UI badge).
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub async fn queue_capture(state: tauri::State<'_, AppState>) -> Result<usize, AppError> {
+    {
+        let q = state
+            .capture_queue
+            .lock()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        if q.len() >= MAX_QUEUED_SHOTS {
+            return Err(AppError::Vision(format!(
+                "screenshot queue is full ({MAX_QUEUED_SHOTS}); describe or clear it"
+            )));
+        }
+    }
+    let img = capture_screen_blocking().await?;
+    let mut q = state
+        .capture_queue
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    q.push(img);
+    tracing::info!(queued = q.len(), "screenshot queued");
+    Ok(q.len())
+}
+
+/// Describe the queued screenshots (capture order = scroll order) in ONE vision
+/// call (Ctrl+Shift+1). An empty queue is the one-key path: capture the screen
+/// right now and describe just that. Streams `vision-delta` events; returns
+/// (and stores) the full description text.
 #[tauri::command]
 #[tracing::instrument(skip(state, app), fields(trace_id = trace_id.as_deref().unwrap_or("-")))]
-pub async fn capture_and_describe(
+pub async fn describe_queue(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     trace_id: Option<String>,
@@ -380,17 +420,34 @@ pub async fn capture_and_describe(
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
-    // xcap grabs synchronously — keep it off the async runtime.
-    let img = tauri::async_runtime::spawn_blocking(crate::capture::capture_primary_jpeg_base64)
-        .await
-        .map_err(|e| AppError::Vision(format!("capture task join: {e}")))?
-        .map_err(|e| AppError::Vision(e.to_string()))?;
+    let mut imgs = {
+        let mut q = state
+            .capture_queue
+            .lock()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        std::mem::take(&mut *q)
+    };
+    if imgs.is_empty() {
+        imgs.push(capture_screen_blocking().await?);
+    }
 
-    let outcome = state
+    let outcome = match state
         .api
-        .describe(&img, vision_model, language, &trace_id, &app)
+        .describe(&imgs, vision_model, language, &trace_id, &app)
         .await
-        .map_err(|e| AppError::Vision(e.to_string()))?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // Put the shots back so a transient API failure doesn't cost the
+            // user their scrolled captures (the UI re-syncs the badge).
+            if let Ok(mut q) = state.capture_queue.lock() {
+                if q.is_empty() {
+                    *q = imgs;
+                }
+            }
+            return Err(AppError::Vision(e.to_string()));
+        }
+    };
 
     if let Ok(mut d) = state.last_description.lock() {
         d.clone_from(&outcome.text);
@@ -400,6 +457,33 @@ pub async fn capture_and_describe(
         .last_vision_ms
         .store(outcome.total_ms, Ordering::Relaxed);
     Ok(outcome.text)
+}
+
+/// Drop all queued screenshots (the 🗑 button).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn clear_capture_queue(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let mut q = state
+        .capture_queue
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let dropped = q.len();
+    q.clear();
+    tracing::info!(dropped, "screenshot queue cleared");
+    Ok(())
+}
+
+/// Current queue length — lets the UI badge re-sync after a reload (the queue
+/// lives in the backend and survives frontend hot reloads).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn capture_queue_len(state: tauri::State<'_, AppState>) -> Result<usize, AppError> {
+    let q = state
+        .capture_queue
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(q.len())
 }
 
 /// Switch the vision (screen-describing) model (`"gpt_4o_mini"` | `"gpt_5_5"`).
