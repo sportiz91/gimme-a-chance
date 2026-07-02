@@ -101,6 +101,17 @@
       opacity: 0.4;
       margin-top: 4px;
     }
+    /* Section header with a per-box clear button (🗑 drops the box AND its context) */
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .section-head button {
+      padding: 0 6px;
+      font-size: 11px;
+      line-height: 18px;
+    }
 
     #transcript {
       max-height: 120px;
@@ -164,10 +175,6 @@
       content: 'Screen description will appear here…';
       opacity: 0.3;
       font-style: italic;
-    }
-    #vision.capturing::after {
-      content: '📸 Capturing…';
-      opacity: 0.5;
     }
     #vision.describing::after {
       content: '👁 Processing image…';
@@ -289,15 +296,21 @@
       </label>
     </div>
 
-    <div class="section-label">Transcript</div>
+    <div class="section-label section-head">
+      <span>Transcript</span>
+      <button onclick="clearTranscript()" title="Clear the transcript and drop its context">🗑</button>
+    </div>
     <div id="transcript"></div>
 
-    <div class="section-label">Vision</div>
+    <div class="section-label section-head">
+      <span>Vision</span>
+      <button onclick="clearVision()" title="Clear the screen descriptions and drop their context">🗑</button>
+    </div>
     <div id="vision"></div>
 
-    <div class="section-label" style="display:flex;align-items:center;justify-content:space-between">
+    <div class="section-label section-head">
       <span>Clipboard</span>
-      <button onclick="clearClipboard()" title="Clear the clipboard box and drop its context" style="padding:0 6px;font-size:11px;line-height:18px">🗑</button>
+      <button onclick="clearClipboard()" title="Clear the clipboard box and drop its context">🗑</button>
     </div>
     <div id="clipboard"></div>
 
@@ -402,12 +415,13 @@
       // wrong place (mic instead of system audio).
       localStorage.setItem('captureSource', source);
       const select = document.getElementById('deviceSelect');
+      // "both" always captures default mic + default output — no device to
+      // pick, so hide the select instead of showing a dead control.
       if (source === 'both') {
-        select.innerHTML = '<option>default mic + default output</option>';
-        select.disabled = true;
+        select.style.display = 'none';
         return;
       }
-      select.disabled = false;
+      select.style.display = '';
       const cmd = source === 'loopback' ? 'list_output_devices' : 'list_audio_devices';
       try {
         const devices = await invoke(cmd);
@@ -496,6 +510,10 @@
     }
 
     async function addShot() {
+      const btn = document.getElementById('addShotBtn');
+      if (btn.disabled) return; // hotkey re-fired while a capture is in flight
+      btn.disabled = true;
+      btn.textContent = '📸 Capturing…';
       try {
         queueCount = await invoke('queue_capture');
         log('info', 'shot_queued', { queued: queueCount });
@@ -505,6 +523,8 @@
         el.textContent = 'Error: ' + e;
         log('error', 'queue_capture_failed', { error: String(e) });
       }
+      btn.disabled = false;
+      btn.textContent = '📸 Add shot';
       renderQueueBadge();
     }
 
@@ -522,6 +542,10 @@
     // Describe the queue (or capture+describe when empty) → vision model → text
     // ingested into context as a 'screen' source.
     async function describeQueue(traceId) {
+      const btn = document.getElementById('describeBtn');
+      if (btn.disabled) return; // hotkey re-fired while a describe is in flight
+      btn.disabled = true;
+      btn.textContent = '👁 Describing…';
       const t = traceId || crypto.randomUUID();
       activeVisionTraceId = t;
       const el = document.getElementById('vision');
@@ -543,6 +567,7 @@
         try { queueCount = await invoke('capture_queue_len'); } catch {}
         log('error', 'describe_failed', { trace_id: t, error: String(e) });
       }
+      btn.disabled = false;
       renderQueueBadge();
     }
 
@@ -573,8 +598,27 @@
       }
     }
 
-    // 🗑 clears the box AND the clip entries in the context store; the backend
-    // also forgets its dedup so re-copying the same text ingests again.
+    // Per-box 🗑: each clears its box AND its entries in the context store.
+    function clearTranscript() {
+      contextLines = contextLines.filter(l => l.speaker !== 'me' && l.speaker !== 'interviewer');
+      partialLines.me = '';
+      partialLines.interviewer = '';
+      lastAnsweredQ = '';
+      renderTranscript();
+      log('info', 'transcript_cleared', {});
+    }
+
+    function clearVision() {
+      activeVisionTraceId = null; // drop any still-streaming vision deltas
+      const el = document.getElementById('vision');
+      el.className = '';
+      el.textContent = '';
+      contextLines = contextLines.filter(l => l.speaker !== 'screen');
+      log('info', 'vision_cleared', {});
+    }
+
+    // The clipboard 🗑 also resets the backend dedup so re-copying the same
+    // text ingests again.
     async function clearClipboard() {
       document.getElementById('clipboard').textContent = '';
       contextLines = contextLines.filter(l => l.speaker !== 'clipboard');
