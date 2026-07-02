@@ -51,15 +51,22 @@ fn system_prompt(language: Language) -> &'static str {
 
 // The vision model transcribes/describes the screen as text; it must NOT solve
 // anything (that's the brain's job) and must answer in the selected language.
+// Code fidelity is non-negotiable: a paraphrased or elided statement poisons
+// every answer built on it, so the prompt bans ellipsis/summarizing outright.
 const VISION_SYS_EN: &str = "You are the eyes of an interview copilot. Transcribe and describe, \
-faithfully and concisely, everything on screen relevant to answering an interview question: the \
-problem statement, code (verbatim), diagrams, and error messages. Do NOT solve anything. \
-Write your description in ENGLISH. Plain text.";
+faithfully, everything on screen relevant to answering an interview question: the problem \
+statement, code, diagrams, and error messages. Transcribe ALL visible code and problem text \
+VERBATIM and COMPLETE — never use ellipsis ('...'), never summarize, never skip lines. \
+Reproduce code character-for-character as an exact code block. Describe non-text elements \
+(diagrams, UI) concisely. Do NOT solve anything. Write in ENGLISH. Plain text.";
 const VISION_SYS_ES: &str =
     "Sos los ojos de un copiloto de entrevistas. Transcribí y describí, de \
-forma fiel y concisa, todo lo que hay en pantalla que sirva para responder una pregunta de \
-entrevista: el enunciado, el código (textual), diagramas y mensajes de error. NO resuelvas nada. \
-Escribí la descripción en ESPAÑOL. Texto plano.";
+forma fiel, todo lo que hay en pantalla que sirva para responder una pregunta de entrevista: el \
+enunciado, el código, diagramas y mensajes de error. Transcribí TODO el código y el enunciado \
+visibles de forma TEXTUAL y COMPLETA — nunca uses puntos suspensivos ('...'), nunca resumas, \
+nunca saltees líneas. Reproducí el código carácter por carácter como un bloque de código exacto. \
+Los elementos no textuales (diagramas, UI) describilos de forma concisa. NO resuelvas nada. \
+Escribí en ESPAÑOL. Texto plano.";
 
 fn vision_system(language: Language) -> &'static str {
     match language {
@@ -82,6 +89,10 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Vision first-token budget. Reasoning models (gpt-5.x) can think a while before
 /// the first visible token, so give more slack than the answer path.
 const VISION_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(25);
+/// Vision output ceiling. A long `LeetCode` statement + examples + code template
+/// runs 1500-2500 tokens; the old 700 silently truncated it, breaking the
+/// "transcribe verbatim and complete" contract.
+const VISION_MAX_OUT: u32 = 2500;
 
 /// Result of one API answer turn.
 pub struct ApiOutcome {
@@ -366,7 +377,13 @@ impl ApiBackend {
                 "detail": "high",
             }},
         ]);
-        let body = chat_body(model.model_id(), vision_system(language), content, 700, 0.2);
+        let body = chat_body(
+            model.model_id(),
+            vision_system(language),
+            content,
+            VISION_MAX_OUT,
+            0.2,
+        );
         let t0 = Instant::now();
         let resp = tokio::time::timeout(
             VISION_FIRST_TOKEN_TIMEOUT,
