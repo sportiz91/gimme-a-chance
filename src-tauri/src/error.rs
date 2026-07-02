@@ -15,6 +15,9 @@ pub enum AppError {
     #[error("Vision error: {0}")]
     Vision(String),
 
+    #[error("Clipboard error: {0}")]
+    Clipboard(String),
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

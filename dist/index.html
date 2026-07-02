@@ -103,7 +103,7 @@
     }
 
     #transcript {
-      max-height: 180px;
+      max-height: 120px;
       overflow-y: auto;
       font-size: 13px;
       line-height: 1.5;
@@ -124,8 +124,8 @@
 
     /* Answer area */
     #response {
-      min-height: 100px;
-      max-height: 400px;
+      min-height: 80px;
+      max-height: 260px;
       overflow-y: auto;
       font-size: 13px;
       line-height: 1.6;
@@ -149,7 +149,7 @@
 
     /* Vision area (screen description) */
     #vision {
-      max-height: 200px;
+      max-height: 140px;
       overflow-y: auto;
       font-size: 13px;
       line-height: 1.5;
@@ -175,6 +175,26 @@
       animation: pulse 1s infinite;
     }
     .spk-screen { color: #ba68c8; font-weight: 700; }
+
+    /* Clipboard area (exact-text ingest — no OCR) */
+    #clipboard {
+      max-height: 120px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 10px;
+      background: rgba(255, 183, 77, 0.08);
+      border-radius: 6px;
+      border: 1px solid rgba(255, 183, 77, 0.25);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    #clipboard:empty::after {
+      content: 'Copied text will appear here…';
+      opacity: 0.3;
+      font-style: italic;
+    }
+    .spk-clip { color: #ffb74d; font-weight: 700; }
 
     /* Manual ask input */
     .ask-row {
@@ -267,6 +287,9 @@
       <button id="addShotBtn" onclick="addShot()" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
       <button id="describeBtn" onclick="describeQueue()" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
       <button id="clearQueueBtn" onclick="clearQueue()" title="Discard queued shots" style="display:none">🗑</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Ingest every copy as context; Ctrl+Shift+V re-ingests the clipboard by hand">
+        <input type="checkbox" id="autoClip" onchange="setAutoClip()" checked> 📋 auto-clip
+      </label>
     </div>
 
     <div class="section-label">Transcript</div>
@@ -274,6 +297,9 @@
 
     <div class="section-label">Vision</div>
     <div id="vision"></div>
+
+    <div class="section-label">Clipboard</div>
+    <div id="clipboard"></div>
 
     <div class="section-label">Answer</div>
     <div id="response"></div>
@@ -518,6 +544,50 @@
       renderQueueBadge();
     }
 
+    // Clipboard ingestion — the exact-text source (no OCR). Auto path: the
+    // backend watcher emits `clipboard-text` on every copy while auto-clip is
+    // on. Manual path (Ctrl+Shift+V): re-reads the clipboard unconditionally.
+    function paintClip(text) {
+      const el = document.getElementById('clipboard');
+      el.textContent = text;
+      el.scrollTop = el.scrollHeight;
+      transcriptLines.push({ speaker: 'clipboard', text });
+      if (transcriptLines.length > MAX_TRANSCRIPT_LINES) transcriptLines.shift();
+      renderTranscript();
+    }
+
+    async function ingestClipboard() {
+      try {
+        const text = await invoke('ingest_clipboard');
+        paintClip(text);
+        log('info', 'clipboard_ingested', { manual: true, chars: text.length });
+      } catch (e) {
+        document.getElementById('clipboard').textContent = 'Error: ' + e;
+        log('error', 'clipboard_ingest_failed', { error: String(e) });
+      }
+    }
+
+    listen('clipboard-text', (event) => {
+      const { text } = event.payload;
+      paintClip(text);
+      log('info', 'clipboard_ingested', { manual: false, chars: text.length });
+    });
+
+    async function setAutoClip() {
+      const enabled = document.getElementById('autoClip').checked;
+      localStorage.setItem('autoClip', enabled);
+      try { await invoke('set_auto_clip', { enabled }); log('info', 'auto_clip_set', { enabled }); }
+      catch (e) { console.error('set_auto_clip failed:', e); }
+    }
+    // Default ON; push the persisted value so both sides agree before the first copy.
+    async function initAutoClip() {
+      const saved = localStorage.getItem('autoClip');
+      const enabled = saved === null ? true : saved === 'true';
+      document.getElementById('autoClip').checked = enabled;
+      try { await invoke('set_auto_clip', { enabled }); }
+      catch (e) { console.error('set_auto_clip (init) failed:', e); }
+    }
+
     async function toggleListening() {
       const btn = document.getElementById('listenBtn');
       const dot = document.getElementById('statusDot');
@@ -570,8 +640,9 @@
       log('info', 'ask_start', { trace_id, manual: !traceId, question_len: q.length });
 
       try {
+        const SOURCE = { me: 'You', screen: 'Screen', clipboard: 'Clipboard' };
         const context = transcriptLines
-          .map(l => (l.speaker === 'me' ? 'You' : l.speaker === 'screen' ? 'Screen' : 'Interviewer') + ': ' + l.text)
+          .map(l => (SOURCE[l.speaker] || 'Interviewer') + ': ' + l.text)
           .join('\n');
         const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
         const elapsed_ms = Math.round(performance.now() - t0);
@@ -623,12 +694,14 @@
     // Global hotkeys, relayed by the backend.
     listen('trigger-queue-capture', () => addShot());
     listen('trigger-describe-queue', () => describeQueue());
+    listen('trigger-clipboard-ingest', () => ingestClipboard());
 
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
     function speakerLabel(who) {
       if (who === 'me') return '<span class="spk-me">You:</span>';
       if (who === 'screen') return '<span class="spk-screen">👁 Screen:</span>';
+      if (who === 'clipboard') return '<span class="spk-clip">📋 Clipboard:</span>';
       return '<span class="spk-int">Interviewer:</span>';
     }
 
@@ -833,6 +906,7 @@
     initVisionModel();
     initBrainModel();
     initQueue();
+    initAutoClip();
   </script>
 </body>
 </html>

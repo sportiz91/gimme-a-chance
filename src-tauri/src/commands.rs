@@ -542,6 +542,36 @@ pub fn get_brain_model(state: tauri::State<'_, AppState>) -> Result<String, AppE
     Ok(m.tag().to_string())
 }
 
+/// Read the current clipboard text and ingest it (Ctrl+Shift+V, the manual
+/// path). No dedup — re-ingesting the same clip on purpose must work — but it
+/// updates the auto-clip dedup state so the watcher doesn't double-ingest.
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub async fn ingest_clipboard(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let text = tauri::async_runtime::spawn_blocking(crate::clipboard::read_text)
+        .await
+        .map_err(|e| AppError::Clipboard(format!("clipboard task join: {e}")))?
+        .map_err(|e| AppError::Clipboard(e.to_string()))?;
+    if text.is_empty() {
+        return Err(AppError::Clipboard("clipboard has no text".into()));
+    }
+    if let Ok(mut last) = state.last_clip.lock() {
+        last.clone_from(&text);
+    }
+    tracing::info!(chars = text.len(), "clipboard ingested (manual)");
+    Ok(text)
+}
+
+/// Toggle the auto-clip monitor (ingest every OS copy) — the UI checkbox.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_auto_clip(state: tauri::State<'_, AppState>, enabled: bool) -> Result<(), AppError> {
+    state.auto_clip.store(enabled, Ordering::Relaxed);
+    tracing::info!(enabled, "auto-clip toggled");
+    Ok(())
+}
+
 /// Structured log entry forwarded from the frontend so that JS timings
 /// and events land in the same JSONL file as Rust logs.
 #[derive(Deserialize)]

@@ -5,6 +5,7 @@ mod alloc_counter;
 mod audio;
 mod backend;
 mod capture;
+mod clipboard;
 mod cloud_stt;
 mod commands;
 mod crashlog;
@@ -22,6 +23,7 @@ mod transcriber;
 mod tts;
 mod vad;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{Emitter, Manager};
@@ -96,6 +98,11 @@ pub struct AppState {
     /// Screenshots queued for a multi-shot describe (base64 JPEGs, in capture
     /// order = the user's top-to-bottom scroll order).
     pub capture_queue: Arc<Mutex<Vec<String>>>,
+    /// Auto-clip: when true (the default), every OS copy is ingested as context.
+    /// The UI checkbox is the off switch for noisy copy-paste sessions.
+    pub auto_clip: Arc<AtomicBool>,
+    /// Last ingested clip — dedup for the auto watcher (manual updates it too).
+    pub last_clip: Arc<Mutex<String>>,
     /// Transcription + answer language. Toggled from the UI; default = English.
     /// Read at `start_listening` (STT engine) and `ask_brain` (prompt) time.
     pub language: Arc<Mutex<lang::Language>>,
@@ -121,6 +128,8 @@ impl Default for AppState {
             brain_model: Arc::new(Mutex::new(backend::BrainModel::default())),
             last_description: Arc::new(Mutex::new(String::new())),
             capture_queue: Arc::new(Mutex::new(Vec::new())),
+            auto_clip: Arc::new(AtomicBool::new(true)),
+            last_clip: Arc::new(Mutex::new(String::new())),
             language: Arc::new(Mutex::new(lang::Language::default())),
             tts: Arc::new(tts::TtsEngine::new()),
             whisper: Arc::new(OnceLock::new()),
@@ -176,10 +185,15 @@ pub fn run() {
     let queue_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Enter);
     let describe_shortcut =
         Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Digit1);
+    // Ctrl+Shift+V: re-ingest the current clipboard by hand (the auto-clip
+    // watcher already ingests every copy while the checkbox is on).
+    let clip_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
     let whisper_cell = Arc::clone(&app_state.whisper);
+    let auto_clip = Arc::clone(&app_state.auto_clip);
+    let last_clip = Arc::clone(&app_state.last_clip);
 
     // Preload the whisper model at startup (off the main thread) so the first
     // "Listen" doesn't pay the ~140MB load, and so it's loaded only once.
@@ -240,6 +254,9 @@ pub fn run() {
                     } else if shortcut == &describe_shortcut {
                         tracing::debug!("describe-queue shortcut pressed");
                         _ = app.emit("trigger-describe-queue", ());
+                    } else if shortcut == &clip_shortcut {
+                        tracing::debug!("clipboard-ingest shortcut pressed");
+                        _ = app.emit("trigger-clipboard-ingest", ());
                     }
                 })
                 .build(),
@@ -254,6 +271,7 @@ pub fn run() {
             for (label, sc) in [
                 ("Ctrl+Shift+Enter", queue_shortcut),
                 ("Ctrl+Shift+1", describe_shortcut),
+                ("Ctrl+Shift+V", clip_shortcut),
             ] {
                 if let Err(e) = app.global_shortcut().register(sc) {
                     tracing::warn!(shortcut = label, error = %e, "shortcut registration failed (held by another app?)");
@@ -265,8 +283,13 @@ pub fn run() {
                 quit = "Ctrl+Shift+Q",
                 queue_capture = "Ctrl+Shift+Enter",
                 describe_queue = "Ctrl+Shift+1",
+                clipboard_ingest = "Ctrl+Shift+V",
                 "global shortcuts registered"
             );
+
+            // OS clipboard listener for auto-clip — its own thread; the message
+            // loop blocks for the app's lifetime.
+            clipboard::spawn_watcher(app.handle().clone(), auto_clip, last_clip);
 
             // Periodic metrics emitter: every 2s push a snapshot to the frontend
             // so the debug panel can refresh without polling. `setup` runs before
@@ -351,6 +374,8 @@ pub fn run() {
             commands::describe_queue,
             commands::clear_capture_queue,
             commands::capture_queue_len,
+            commands::ingest_clipboard,
+            commands::set_auto_clip,
             commands::set_vision_model,
             commands::get_vision_model,
             commands::set_brain_model,

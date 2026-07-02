@@ -27,6 +27,11 @@ futures-util = "0.3"
 xcap = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64 = "0.22"
+# Clipboard ingestion: arboard reads the text (exact — no OCR; text-only, so no
+# default image-data feature); clipboard-master listens for OS clipboard-change
+# events (AddClipboardFormatListener on Windows, not polling) for auto-clip.
+arboard = { version = "3", default-features = false }
+clipboard-master = "4"
 # Secrets: in-memory protection (SecretString) + at-rest OS keyring.
 secrecy = "0.8"
 keyring = { version = "3", features = ["windows-native"] }
