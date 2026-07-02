@@ -57,20 +57,24 @@ fn system_prompt(language: Language) -> &'static str {
 // copilot": with multiple shots of a problem statement, the copilot framing
 // sometimes pattern-matched as exam cheating and drew refusals ("I can't help
 // with that"). Transcription itself is innocuous — keep the prompt about that.
-const VISION_SYS_EN: &str = "You are a meticulous screen transcriptionist. Transcribe and \
-describe, faithfully, everything visible on the screen: problem statements, code, diagrams, \
-error messages, and UI text. Transcribe ALL visible code and prose VERBATIM and COMPLETE — \
-never use ellipsis ('...'), never summarize, never skip lines. Reproduce code \
-character-for-character as an exact code block. Describe non-text elements (diagrams, UI) \
-concisely. Do NOT solve, answer, or comment on anything — only transcribe and describe. \
-Write in ENGLISH. Plain text.";
-const VISION_SYS_ES: &str = "Sos un transcriptor meticuloso de pantallas. Transcribí y \
-describí, de forma fiel, todo lo visible en pantalla: enunciados, código, diagramas, mensajes \
-de error y texto de UI. Transcribí TODO el código y el texto visibles de forma TEXTUAL y \
-COMPLETA — nunca uses puntos suspensivos ('...'), nunca resumas, nunca saltees líneas. \
-Reproducí el código carácter por carácter como un bloque de código exacto. Los elementos no \
-textuales (diagramas, UI) describilos de forma concisa. NO resuelvas, respondas ni comentes \
-nada — solamente transcribí y describí. Escribí en ESPAÑOL. Texto plano.";
+// "The user's own screen" is stated (truthfully) because a full-monitor shot
+// (tabs, logged-in avatars, taskbar) otherwise reads as surveilling someone
+// else's screen — another refusal magnet.
+const VISION_SYS_EN: &str = "You are a meticulous screen transcriptionist. The user is sharing \
+screenshots of their own screen. Transcribe and describe, faithfully, everything visible: \
+problem statements, code, diagrams, error messages, and UI text. Transcribe ALL visible code \
+and prose VERBATIM and COMPLETE — never use ellipsis ('...'), never summarize, never skip \
+lines. Reproduce code character-for-character as an exact code block. Describe non-text \
+elements (diagrams, UI) concisely. Do NOT solve, answer, or comment on anything — only \
+transcribe and describe. Write in ENGLISH. Plain text.";
+const VISION_SYS_ES: &str = "Sos un transcriptor meticuloso de pantallas. El usuario te \
+comparte capturas de su propia pantalla. Transcribí y describí, de forma fiel, todo lo \
+visible: enunciados, código, diagramas, mensajes de error y texto de UI. Transcribí TODO el \
+código y el texto visibles de forma TEXTUAL y COMPLETA — nunca uses puntos suspensivos \
+('...'), nunca resumas, nunca saltees líneas. Reproducí el código carácter por carácter como \
+un bloque de código exacto. Los elementos no textuales (diagramas, UI) describilos de forma \
+concisa. NO resuelvas, respondas ni comentes nada — solamente transcribí y describí. Escribí \
+en ESPAÑOL. Texto plano.";
 
 fn vision_system(language: Language) -> &'static str {
     match language {
@@ -79,31 +83,31 @@ fn vision_system(language: Language) -> &'static str {
     }
 }
 
-// With several shots the user scrolled a long page: the shots are ordered
-// top-to-bottom and adjacent ones overlap, so the model must stitch, not repeat.
-fn vision_instruction(language: Language, shots: usize) -> String {
+// Several shots are described PER IMAGE ("Image N: …"), with scroll-stitching
+// as the conditional case. The old wording asserted the shots were "consecutive
+// scrolls of the SAME page" — with unrelated shots that false premise both drew
+// refusals and made the model merge/drop the later images (measured: ~1650
+// chars merged vs ~2000+ per-image on the same two screenshots).
+fn vision_instruction(language: Language, shots: usize) -> &'static str {
     match language {
         Language::English => {
             if shots <= 1 {
-                "Transcribe and describe this screenshot.".into()
+                "Transcribe and describe this screenshot."
             } else {
-                format!(
-                    "These {shots} screenshots are consecutive scrolls (top to bottom) of the \
-                     SAME page; adjacent shots may overlap. Reconstruct the complete content \
-                     once, in reading order, without repeating the overlapping parts."
-                )
+                "Transcribe and describe each screenshot SEPARATELY and in order, under the \
+                 heading 'Image N:'. If two consecutive screenshots are scrolls of the same \
+                 page, continue the transcription without repeating the overlap. Transcribe \
+                 ALL visible code COMPLETE — do not cut anything."
             }
         }
         Language::Spanish => {
             if shots <= 1 {
-                "Transcribí y describí esta captura de pantalla.".into()
+                "Transcribí y describí esta captura de pantalla."
             } else {
-                format!(
-                    "Estas {shots} capturas son scrolls consecutivos (de arriba hacia abajo) de \
-                     la MISMA página; capturas adyacentes pueden solaparse. Reconstruí el \
-                     contenido completo una sola vez, en orden de lectura, sin repetir lo \
-                     solapado."
-                )
+                "Transcribí y describí cada captura POR SEPARADO y en orden, con el encabezado \
+                 'Imagen N:'. Si dos capturas consecutivas son scrolls de la misma página, \
+                 continuá la transcripción sin repetir lo solapado. Todo el código visible: \
+                 transcribilo COMPLETO, sin cortar nada."
             }
         }
     }
