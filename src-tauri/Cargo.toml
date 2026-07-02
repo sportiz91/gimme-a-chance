@@ -32,8 +32,10 @@ base64 = "0.22"
 # events (AddClipboardFormatListener on Windows, not polling) for auto-clip.
 arboard = { version = "3", default-features = false }
 clipboard-master = "4"
-# Ctrl+Shift+V simulates Ctrl+C on the focused app (SendInput) before ingesting,
-# so one hotkey turns the current selection into context.
+# Ctrl+Shift+V reads the focused app's selection via UI Automation (TextPattern)
+# — no keystroke, no clipboard write, invisible to the target app's JS. enigo
+# (SendInput) is the synthetic-Ctrl+C fallback for apps without UIA text support.
+uiautomation = "0.25"
 enigo = "0.6"
 # Secrets: in-memory protection (SecretString) + at-rest OS keyring.
 secrecy = "0.8"
