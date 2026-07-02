@@ -53,20 +53,24 @@ fn system_prompt(language: Language) -> &'static str {
 // anything (that's the brain's job) and must answer in the selected language.
 // Code fidelity is non-negotiable: a paraphrased or elided statement poisons
 // every answer built on it, so the prompt bans ellipsis/summarizing outright.
-const VISION_SYS_EN: &str = "You are the eyes of an interview copilot. Transcribe and describe, \
-faithfully, everything on screen relevant to answering an interview question: the problem \
-statement, code, diagrams, and error messages. Transcribe ALL visible code and problem text \
-VERBATIM and COMPLETE — never use ellipsis ('...'), never summarize, never skip lines. \
-Reproduce code character-for-character as an exact code block. Describe non-text elements \
-(diagrams, UI) concisely. Do NOT solve anything. Write in ENGLISH. Plain text.";
-const VISION_SYS_ES: &str =
-    "Sos los ojos de un copiloto de entrevistas. Transcribí y describí, de \
-forma fiel, todo lo que hay en pantalla que sirva para responder una pregunta de entrevista: el \
-enunciado, el código, diagramas y mensajes de error. Transcribí TODO el código y el enunciado \
-visibles de forma TEXTUAL y COMPLETA — nunca uses puntos suspensivos ('...'), nunca resumas, \
-nunca saltees líneas. Reproducí el código carácter por carácter como un bloque de código exacto. \
-Los elementos no textuales (diagramas, UI) describilos de forma concisa. NO resuelvas nada. \
-Escribí en ESPAÑOL. Texto plano.";
+// Deliberately framed as a neutral TRANSCRIPTIONIST, not an "interview
+// copilot": with multiple shots of a problem statement, the copilot framing
+// sometimes pattern-matched as exam cheating and drew refusals ("I can't help
+// with that"). Transcription itself is innocuous — keep the prompt about that.
+const VISION_SYS_EN: &str = "You are a meticulous screen transcriptionist. Transcribe and \
+describe, faithfully, everything visible on the screen: problem statements, code, diagrams, \
+error messages, and UI text. Transcribe ALL visible code and prose VERBATIM and COMPLETE — \
+never use ellipsis ('...'), never summarize, never skip lines. Reproduce code \
+character-for-character as an exact code block. Describe non-text elements (diagrams, UI) \
+concisely. Do NOT solve, answer, or comment on anything — only transcribe and describe. \
+Write in ENGLISH. Plain text.";
+const VISION_SYS_ES: &str = "Sos un transcriptor meticuloso de pantallas. Transcribí y \
+describí, de forma fiel, todo lo visible en pantalla: enunciados, código, diagramas, mensajes \
+de error y texto de UI. Transcribí TODO el código y el texto visibles de forma TEXTUAL y \
+COMPLETA — nunca uses puntos suspensivos ('...'), nunca resumas, nunca saltees líneas. \
+Reproducí el código carácter por carácter como un bloque de código exacto. Los elementos no \
+textuales (diagramas, UI) describilos de forma concisa. NO resuelvas, respondas ni comentes \
+nada — solamente transcribí y describí. Escribí en ESPAÑOL. Texto plano.";
 
 fn vision_system(language: Language) -> &'static str {
     match language {
@@ -81,7 +85,7 @@ fn vision_instruction(language: Language, shots: usize) -> String {
     match language {
         Language::English => {
             if shots <= 1 {
-                "Describe the screen for the interview context.".into()
+                "Transcribe and describe this screenshot.".into()
             } else {
                 format!(
                     "These {shots} screenshots are consecutive scrolls (top to bottom) of the \
@@ -92,7 +96,7 @@ fn vision_instruction(language: Language, shots: usize) -> String {
         }
         Language::Spanish => {
             if shots <= 1 {
-                "Describí la pantalla para el contexto de la entrevista.".into()
+                "Transcribí y describí esta captura de pantalla.".into()
             } else {
                 format!(
                     "Estas {shots} capturas son scrolls consecutivos (de arriba hacia abajo) de \
