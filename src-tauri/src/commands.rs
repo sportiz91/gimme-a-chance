@@ -371,11 +371,46 @@ async fn capture_screen_blocking() -> Result<String, AppError> {
         .map_err(|e| AppError::Vision(e.to_string()))
 }
 
+/// Capture with the overlay hidden. `contentProtected` makes DXGI duplication
+/// render our window as a BLACK RECTANGLE over everything beneath it — it
+/// covered most of every shot (the model couldn't see the page behind it, and
+/// a large redacted region is itself a refusal magnet for gpt-4o-mini).
+/// Hide → capture → restore. Costs a ~200ms flicker of the overlay.
+async fn capture_screen_hiding_overlay(app: &tauri::AppHandle) -> Result<String, AppError> {
+    use tauri::Manager;
+    let window = app.get_webview_window("main");
+    let was_visible = window
+        .as_ref()
+        .is_some_and(|w| w.is_visible().unwrap_or(false));
+    if was_visible {
+        if let Some(w) = &window {
+            if let Err(e) = w.hide() {
+                tracing::warn!(error = %e, "could not hide overlay for capture");
+            } else {
+                // A beat for the compositor to actually drop the window.
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+        }
+    }
+    let img = capture_screen_blocking().await;
+    if was_visible {
+        if let Some(w) = &window {
+            if let Err(e) = w.show() {
+                tracing::warn!(error = %e, "could not re-show overlay after capture");
+            }
+        }
+    }
+    img
+}
+
 /// Capture the primary monitor onto the screenshot queue (Ctrl+Shift+Enter),
 /// for a later multi-shot describe. Returns the queue length (the UI badge).
 #[tauri::command]
-#[tracing::instrument(skip(state))]
-pub async fn queue_capture(state: tauri::State<'_, AppState>) -> Result<usize, AppError> {
+#[tracing::instrument(skip(state, app))]
+pub async fn queue_capture(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<usize, AppError> {
     {
         let q = state
             .capture_queue
@@ -387,7 +422,7 @@ pub async fn queue_capture(state: tauri::State<'_, AppState>) -> Result<usize, A
             )));
         }
     }
-    let img = capture_screen_blocking().await?;
+    let img = capture_screen_hiding_overlay(&app).await?;
     let mut q = state
         .capture_queue
         .lock()
@@ -428,13 +463,13 @@ pub async fn describe_queue(
         std::mem::take(&mut *q)
     };
     if imgs.is_empty() {
-        imgs.push(capture_screen_blocking().await?);
+        imgs.push(capture_screen_hiding_overlay(&app).await?);
     }
 
     #[cfg(debug_assertions)]
     dump_captures(&trace_id, &imgs);
 
-    let outcome = match state
+    let mut outcome = match state
         .api
         .describe(&imgs, vision_model, language, &trace_id, &app)
         .await
@@ -451,6 +486,30 @@ pub async fn describe_queue(
             return Err(AppError::Vision(e.to_string()));
         }
     };
+
+    // gpt-4o-mini deterministically refused some multi-shot desktop captures
+    // that gpt-5.5 handled fine (measured 2/2 vs 0/2 on dumped shots). Rather
+    // than hand the user a refusal, burn the extra latency and retry once with
+    // gpt-5.5; if the retry also fails, keep the original text.
+    if crate::backend::looks_like_refusal(&outcome.text)
+        && !matches!(vision_model, crate::backend::VisionModel::Gpt55)
+    {
+        tracing::warn!(text = %outcome.text, "describe refused; retrying once with gpt-5.5");
+        match state
+            .api
+            .describe(
+                &imgs,
+                crate::backend::VisionModel::Gpt55,
+                language,
+                &trace_id,
+                &app,
+            )
+            .await
+        {
+            Ok(o) => outcome = o,
+            Err(e) => tracing::warn!(error = %e, "gpt-5.5 retry failed; keeping the refusal text"),
+        }
+    }
 
     if let Ok(mut d) = state.last_description.lock() {
         d.clone_from(&outcome.text);

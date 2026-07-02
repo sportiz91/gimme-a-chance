@@ -446,12 +446,7 @@ impl ApiBackend {
         .await?;
         // A refusal streams back as a normal, tiny completion — flag it loudly
         // so log analysis doesn't mistake it for a nearly-empty screen.
-        let lower = text.to_lowercase();
-        if text.len() < 200
-            && ["no puedo", "lo siento", "i can't", "i cannot", "sorry"]
-                .iter()
-                .any(|m| lower.contains(m))
-        {
+        if looks_like_refusal(&text) {
             tracing::warn!(chars = text.len(), text = %text, "vision describe looks like a REFUSAL");
         }
         tracing::info!(
@@ -468,6 +463,18 @@ impl ApiBackend {
             total_ms,
         })
     }
+}
+
+/// Heuristic: a tiny completion whose text apologizes is a refusal, not a
+/// nearly-empty screen. Drives the WARN above and the gpt-5.5 retry in
+/// `describe_queue`.
+#[must_use]
+pub fn looks_like_refusal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text.len() < 200
+        && ["no puedo", "lo siento", "i can't", "i cannot", "sorry"]
+            .iter()
+            .any(|m| lower.contains(m))
 }
 
 /// Build an `OpenAI`-style chat/completions body. Reasoning models (gpt-5.x) reject
