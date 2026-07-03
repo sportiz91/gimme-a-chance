@@ -1,5 +1,6 @@
 #[cfg(feature = "sherpa")]
 mod aec;
+mod agent;
 #[cfg(feature = "counting-alloc")]
 mod alloc_counter;
 mod audio;
@@ -85,7 +86,9 @@ static DHAT_PROFILER: std::sync::OnceLock<std::sync::Mutex<Option<dhat::Profiler
 /// Shared app state across Tauri commands
 pub struct AppState {
     pub is_listening: Arc<Mutex<bool>>,
-    pub transcript: Arc<Mutex<String>>,
+    /// Agent-mode session: the rolling interview transcript (all sources,
+    /// append-only) + the background-refreshed Interview State document.
+    pub agent: Arc<agent::AgentSession>,
     pub metrics: Arc<metrics::Metrics>,
     /// Direct-API backend (Groq → `OpenAI` fallback chain). Built at startup.
     pub api: Arc<backend::ApiBackend>,
@@ -124,7 +127,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             is_listening: Arc::new(Mutex::new(false)),
-            transcript: Arc::new(Mutex::new(String::new())),
+            agent: Arc::new(agent::AgentSession::default()),
             metrics: Arc::new(metrics::Metrics::default()),
             api: Arc::new(backend::ApiBackend::new()),
             vision_model: Arc::new(Mutex::new(backend::VisionModel::default())),
@@ -192,6 +195,9 @@ pub fn run() {
     // Ctrl+Shift+V: re-ingest the current clipboard by hand (the auto-clip
     // watcher already ingests every copy while the checkbox is on).
     let clip_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
+    // Ctrl+Shift+Space: the agent press — "read everything so far and help me
+    // with whatever is needed RIGHT NOW" (no question heuristics involved).
+    let agent_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
@@ -262,6 +268,9 @@ pub fn run() {
                     } else if shortcut == &clip_shortcut {
                         tracing::debug!("clipboard-ingest shortcut pressed");
                         _ = app.emit("trigger-clipboard-ingest", ());
+                    } else if shortcut == &agent_shortcut {
+                        tracing::debug!("agent-query shortcut pressed");
+                        _ = app.emit("trigger-agent-query", ());
                     }
                 })
                 .build(),
@@ -273,10 +282,13 @@ pub fn run() {
             // The queue/describe bindings are shared with screen-peek; if that
             // overlay is running it owns them, so a failed registration must not
             // kill the app — warn and leave the UI buttons as the fallback.
+            // Ctrl+Shift+Space rides along: some IMEs/apps hold it, and the 🤖
+            // button covers a lost registration.
             for (label, sc) in [
                 ("Ctrl+Shift+Enter", queue_shortcut),
                 ("Ctrl+Shift+1", describe_shortcut),
                 ("Ctrl+Shift+V", clip_shortcut),
+                ("Ctrl+Shift+Space", agent_shortcut),
             ] {
                 if let Err(e) = app.global_shortcut().register(sc) {
                     tracing::warn!(shortcut = label, error = %e, "shortcut registration failed (held by another app?)");
@@ -289,6 +301,7 @@ pub fn run() {
                 queue_capture = "Ctrl+Shift+Enter",
                 describe_queue = "Ctrl+Shift+1",
                 clipboard_ingest = "Ctrl+Shift+V",
+                agent_query = "Ctrl+Shift+Space",
                 "global shortcuts registered"
             );
 
@@ -375,6 +388,7 @@ pub fn run() {
             commands::start_listening,
             commands::stop_listening,
             commands::ask_brain,
+            commands::ask_agent,
             commands::queue_capture,
             commands::describe_queue,
             commands::clear_capture_queue,

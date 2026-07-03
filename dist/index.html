@@ -288,6 +288,7 @@
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
       </select>
+      <button id="agentBtn" onclick="askAgent()" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space)">🤖 Agent</button>
       <button id="addShotBtn" onclick="addShot()" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
       <button id="describeBtn" onclick="describeQueue()" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
       <button id="clearQueueBtn" onclick="clearQueue()" title="Discard queued shots" style="display:none">🗑</button>
@@ -349,6 +350,10 @@
     <div class="row"><span class="key">last vision</span><span class="val" id="dbgVision">—</span></div>
     <div class="row"><span class="key">provider</span><span class="val" id="dbgProvider">—</span></div>
     <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
+    <div class="row"><span class="key">transcript</span><span class="val" id="dbgTranscript">—</span></div>
+    <div class="row"><span class="key">agent ctx</span><span class="val" id="dbgAgentCtx">—</span></div>
+    <div class="row"><span class="key">agent cached</span><span class="val" id="dbgAgentCached">—</span></div>
+    <div class="row"><span class="key">state age</span><span class="val" id="dbgStateAge">—</span></div>
     <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
     <div class="row"><span class="key">heap peak</span><span class="val" id="dbgHeapPeak">—</span></div>
     <div class="row"><span class="key">heap total alloc'd</span><span class="val" id="dbgHeapTotal">—</span></div>
@@ -478,23 +483,41 @@
     }
 
     // Vision & brain model selection (mirrors setLanguage / initLanguage).
+    // Persisted in localStorage — the backend resets to defaults each launch,
+    // and a silently-reset brain means an agent press on the wrong model.
     async function setVisionModel() {
       const model = document.getElementById('visionSelect').value;
+      localStorage.setItem('visionModel', model);
       try { await invoke('set_vision_model', { model }); log('info', 'vision_model_set', { model }); }
       catch (e) { console.error('set_vision_model failed:', e); }
     }
     async function initVisionModel() {
-      try { document.getElementById('visionSelect').value = await invoke('get_vision_model'); }
-      catch (e) { console.error('get_vision_model failed:', e); }
+      const saved = localStorage.getItem('visionModel');
+      try {
+        if (saved) {
+          document.getElementById('visionSelect').value = saved;
+          await invoke('set_vision_model', { model: saved });
+        } else {
+          document.getElementById('visionSelect').value = await invoke('get_vision_model');
+        }
+      } catch (e) { console.error('initVisionModel failed:', e); }
     }
     async function setBrainModel() {
       const model = document.getElementById('brainSelect').value;
+      localStorage.setItem('brainModel', model);
       try { await invoke('set_brain_model', { model }); log('info', 'brain_model_set', { model }); }
       catch (e) { console.error('set_brain_model failed:', e); }
     }
     async function initBrainModel() {
-      try { document.getElementById('brainSelect').value = await invoke('get_brain_model'); }
-      catch (e) { console.error('get_brain_model failed:', e); }
+      const saved = localStorage.getItem('brainModel');
+      try {
+        if (saved) {
+          document.getElementById('brainSelect').value = saved;
+          await invoke('set_brain_model', { model: saved });
+        } else {
+          document.getElementById('brainSelect').value = await invoke('get_brain_model');
+        }
+      } catch (e) { console.error('initBrainModel failed:', e); }
     }
 
     // Screenshot queue: Ctrl+Shift+Enter stacks captures (scroll a long page
@@ -727,6 +750,44 @@
       }
     }
 
+    // Agent press: NO question extraction — the backend sends the FULL rolling
+    // transcript + Interview State and the model infers what help is needed.
+    // Streams into the same Answer box via answer-delta.
+    async function askAgent() {
+      const btn = document.getElementById('agentBtn');
+      if (btn.disabled) return; // hotkey re-fired while a press is in flight
+      btn.disabled = true;
+      btn.textContent = '🤖 Thinking…';
+      const trace_id = crypto.randomUUID();
+      activeTraceId = trace_id;
+      firstDeltaSeen = false;
+      const t0 = performance.now();
+      const responseEl = document.getElementById('response');
+      responseEl.textContent = '';
+      responseEl.classList.add('loading');
+      log('info', 'agent_press', { trace_id });
+      try {
+        const answer = await invoke('ask_agent', { traceId: trace_id });
+        responseEl.classList.remove('loading');
+        responseEl.textContent = answer;
+        log('info', 'agent_complete', {
+          trace_id,
+          elapsed_ms: Math.round(performance.now() - t0),
+          answer_len: answer.length,
+        });
+      } catch (e) {
+        responseEl.classList.remove('loading');
+        responseEl.textContent = 'Error: ' + e;
+        log('error', 'agent_failed', {
+          trace_id,
+          elapsed_ms: Math.round(performance.now() - t0),
+          error: String(e),
+        });
+      }
+      btn.disabled = false;
+      btn.textContent = '🤖 Agent';
+    }
+
     // Stream the answer token-by-token as it arrives from the backend.
     // The final full answer still comes back from the `ask_brain` invoke (which
     // reconciles `textContent`), but these deltas paint the first line in ~1s.
@@ -758,6 +819,7 @@
     listen('trigger-queue-capture', () => addShot());
     listen('trigger-describe-queue', () => describeQueue());
     listen('trigger-clipboard-ingest', () => ingestClipboard());
+    listen('trigger-agent-query', () => askAgent());
 
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
@@ -939,6 +1001,21 @@
       document.getElementById('dbgVision').textContent = m.last_vision_ms ? m.last_vision_ms + ' ms' : '—';
       document.getElementById('dbgProvider').textContent = m.last_provider || '—';
       if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
+
+      // Agent-mode gauges: transcript growth (chars/4 ≈ tokens), last press's
+      // real prompt size + prompt-cache hit rate, Interview State freshness.
+      document.getElementById('dbgTranscript').textContent = m.transcript_lines
+        ? `${m.transcript_lines} lines / ~${(m.transcript_chars / 4 / 1000).toFixed(1)}K tok`
+        : '—';
+      document.getElementById('dbgAgentCtx').textContent = m.agent_prompt_tokens
+        ? `${(m.agent_prompt_tokens / 1000).toFixed(1)}K tok in / ${m.agent_completion_tokens} out`
+        : '—';
+      document.getElementById('dbgAgentCached').textContent = m.agent_prompt_tokens
+        ? Math.round((100 * m.agent_cached_tokens) / m.agent_prompt_tokens) + '%'
+        : '—';
+      document.getElementById('dbgStateAge').textContent = m.state_epoch_s
+        ? Math.max(0, Math.round(Date.now() / 1000 - m.state_epoch_s)) + 's ago'
+        : 'never';
 
       // Allocator label is always populated — it's compile-time constant.
       document.getElementById('dbgAllocator').textContent = m.allocator_name || '—';

@@ -33,6 +33,15 @@ pub struct Metrics {
     /// Which backend/provider answered the last turn (e.g. `groq/llama-3.1-8b-instant`).
     /// A `String`, so it lives behind a `Mutex` rather than an atomic.
     pub last_provider: Mutex<String>,
+    // Agent-mode gauges: transcript growth, Interview State freshness, and the
+    // last press's token usage (the prompt-cache health check).
+    pub transcript_chars: AtomicU64,
+    pub transcript_lines: AtomicU64,
+    /// Unix seconds of the last successful Interview State refresh (0 = never).
+    pub state_epoch_s: AtomicU64,
+    pub agent_prompt_tokens: AtomicU64,
+    pub agent_cached_tokens: AtomicU64,
+    pub agent_completion_tokens: AtomicU64,
     // Heap fields are always present but only populated when `counting-alloc`
     // is active. When the feature is off they stay at 0 and the UI shows "—".
     pub heap_live_bytes: AtomicU64,
@@ -57,6 +66,12 @@ impl Default for Metrics {
             last_llm_ttft_ms: AtomicU64::new(0),
             last_vision_ms: AtomicU64::new(0),
             last_provider: Mutex::new(String::new()),
+            transcript_chars: AtomicU64::new(0),
+            transcript_lines: AtomicU64::new(0),
+            state_epoch_s: AtomicU64::new(0),
+            agent_prompt_tokens: AtomicU64::new(0),
+            agent_cached_tokens: AtomicU64::new(0),
+            agent_completion_tokens: AtomicU64::new(0),
             heap_live_bytes: AtomicU64::new(0),
             heap_total_allocated_bytes: AtomicU64::new(0),
             heap_peak_live_bytes: AtomicU64::new(0),
@@ -93,6 +108,12 @@ impl Metrics {
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default(),
+            transcript_chars: self.transcript_chars.load(Ordering::Relaxed),
+            transcript_lines: self.transcript_lines.load(Ordering::Relaxed),
+            state_epoch_s: self.state_epoch_s.load(Ordering::Relaxed),
+            agent_prompt_tokens: self.agent_prompt_tokens.load(Ordering::Relaxed),
+            agent_cached_tokens: self.agent_cached_tokens.load(Ordering::Relaxed),
+            agent_completion_tokens: self.agent_completion_tokens.load(Ordering::Relaxed),
             heap_live_bytes: self.heap_live_bytes.load(Ordering::Relaxed),
             heap_total_allocated_bytes: self.heap_total_allocated_bytes.load(Ordering::Relaxed),
             heap_peak_live_bytes: self.heap_peak_live_bytes.load(Ordering::Relaxed),
@@ -164,6 +185,12 @@ pub struct MetricsSnapshot {
     pub last_llm_ttft_ms: u64,
     pub last_vision_ms: u64,
     pub last_provider: String,
+    pub transcript_chars: u64,
+    pub transcript_lines: u64,
+    pub state_epoch_s: u64,
+    pub agent_prompt_tokens: u64,
+    pub agent_cached_tokens: u64,
+    pub agent_completion_tokens: u64,
     pub heap_live_bytes: u64,
     pub heap_total_allocated_bytes: u64,
     pub heap_peak_live_bytes: u64,

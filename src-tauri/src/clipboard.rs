@@ -164,6 +164,7 @@ impl ClipboardHandler for Watcher {
                     last.clone_from(&text);
                 }
                 tracing::info!(chars = text.len(), "auto-clip ingested");
+                crate::agent::push_line(&self.app, "clipboard", &text);
                 _ = self.app.emit("clipboard-text", ClipboardText { text });
             }
             // Empty text, or a non-text copy (image/files) — nothing to ingest.

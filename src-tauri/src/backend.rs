@@ -83,6 +83,134 @@ fn vision_system(language: Language) -> &'static str {
     }
 }
 
+// ── Agent mode ──────────────────────────────────────────────────────────────
+//
+// The agent press sends [static system] + [full transcript] + [volatile tail]
+// and lets the MODEL infer what help is needed — no question heuristics. Two
+// prompt-design rules are borrowed from the harnesses that iterated on this
+// the longest (Hermes, OpenClaw): the LAST transcript lines win over anything
+// earlier ("latest signal wins"), and decisions already made in the interview
+// are binding context, never to be re-litigated.
+
+const AGENT_SYS_EN: &str = "You are a live interview copilot agent. You receive the full \
+transcript so far of a job interview happening RIGHT NOW — lines labeled 'Interviewer:' \
+(their voice), 'You:' (the candidate, the user you are helping), 'Screen:' (descriptions of \
+the user's screen) and 'Clipboard:' (text the user captured) — followed by an INTERVIEW STATE \
+summary maintained in the background.\n\
+The user pressed the help hotkey. Work out what would help them most at this exact moment \
+and provide it. Rules:\n\
+- The LAST few transcript lines decide what is needed now; everything earlier is background. \
+If the interviewer's latest question or challenge is not fully answered yet, that is the target.\n\
+- Honor every decision already made in the interview (INTERVIEW STATE + transcript): build on \
+them, never contradict or re-litigate them.\n\
+- Stay consistent with everything the user has already claimed about their experience.\n\
+- Don't re-cover ground already handled unless the interviewer is revisiting it.\n\
+- Format by need: something to SAY out loud → under 4 sentences, natural and speakable. \
+Coding → the code plus a 1-2 sentence approach. System design or open-ended discussion → a \
+tight bullet skeleton the user can glance at while talking.\n\
+- Answer in the language the interview is currently conducted in.";
+const AGENT_SYS_ES: &str = "Sos un agente copiloto de entrevistas en vivo. Recibís la \
+transcripción completa hasta ahora de una entrevista de trabajo que está pasando AHORA MISMO \
+— líneas etiquetadas 'Interviewer:' (la voz del entrevistador), 'You:' (el candidato, el \
+usuario al que ayudás), 'Screen:' (descripciones de la pantalla del usuario) y 'Clipboard:' \
+(texto que el usuario capturó) — seguida de un resumen INTERVIEW STATE mantenido en segundo \
+plano.\n\
+El usuario apretó el atajo de ayuda. Deducí qué es lo que más lo ayudaría en este momento \
+exacto y dáselo. Reglas:\n\
+- Las ÚLTIMAS líneas de la transcripción deciden qué hace falta ahora; todo lo anterior es \
+contexto. Si la última pregunta o desafío del entrevistador todavía no está respondido del \
+todo, ese es el objetivo.\n\
+- Respetá cada decisión ya tomada en la entrevista (INTERVIEW STATE + transcripción): \
+construí sobre ellas, nunca las contradigas ni las reabras.\n\
+- Mantené consistencia con todo lo que el usuario ya afirmó sobre su experiencia.\n\
+- No repitas terreno ya cubierto salvo que el entrevistador esté volviendo sobre él.\n\
+- Formato según la necesidad: algo para DECIR en voz alta → menos de 4 oraciones, natural y \
+hablable. Código → el código más 1-2 oraciones de enfoque. System design o discusión abierta \
+→ un esqueleto de bullets conciso que el usuario pueda mirar de reojo mientras habla.\n\
+- Respondé en el idioma en el que se está desarrollando la entrevista.";
+
+fn agent_system(language: Language) -> &'static str {
+    match language {
+        Language::English => AGENT_SYS_EN,
+        Language::Spanish => AGENT_SYS_ES,
+    }
+}
+
+/// The volatile tail: Interview State + the press instruction. Rides at the
+/// END of the prompt where attention is strongest; framed as REFERENCE ONLY
+/// with the live transcript winning conflicts (the Hermes lesson — models
+/// otherwise answer questions out of the summary instead of the live moment).
+fn agent_tail(state_block: &str, language: Language) -> String {
+    let state_section = if state_block.is_empty() {
+        String::new()
+    } else {
+        match language {
+            Language::English => format!(
+                "=== INTERVIEW STATE (background summary — reference only; it may lag the \
+                 live transcript by a few minutes, and the transcript WINS on any conflict) ===\n\
+                 {state_block}\n\
+                 === END INTERVIEW STATE ===\n\n"
+            ),
+            Language::Spanish => format!(
+                "=== INTERVIEW STATE (resumen de fondo — solo referencia; puede correr unos \
+                 minutos detrás de la transcripción en vivo, y ante cualquier conflicto GANA \
+                 la transcripción) ===\n\
+                 {state_block}\n\
+                 === FIN INTERVIEW STATE ===\n\n"
+            ),
+        }
+    };
+    let request = match language {
+        Language::English => {
+            "HELP REQUEST: the user pressed the help hotkey NOW. Based on the final \
+             transcript lines above (the current moment), give the most useful help right now."
+        }
+        Language::Spanish => {
+            "PEDIDO DE AYUDA: el usuario apretó el atajo de ayuda AHORA. Basándote en las \
+             últimas líneas de la transcripción (el momento actual), dale la ayuda más útil \
+             ahora mismo."
+        }
+    };
+    format!("{state_section}{request}")
+}
+
+// The Interview State maintainer runs on the cheap sibling model in the
+// background. Update-mode by design (OpenClaw/Hermes pattern): it PRESERVES
+// the previous document and folds the delta in, instead of re-summarizing
+// from scratch — repeated re-summarization is what loses the obscure details
+// (a decision's rationale, an exact QPS figure) over a long session.
+const STATE_MODEL: &str = "gpt-5.4-mini";
+const STATE_SYS: &str = "You maintain the INTERVIEW STATE document for a live job interview, \
+on behalf of the candidate. Given the previous document and the newest transcript lines \
+(labeled Interviewer/You/Screen/Clipboard), output the UPDATED document — the document only, \
+no preamble, no code fences.\n\
+Use this EXACT format:\n\
+## Active Question\n\
+[The interviewer's most recent question or challenge that the candidate has not fully \
+resolved, VERBATIM in its original language. A question just asked IS active. 'None' only if \
+the latest exchange is fully resolved.]\n\
+## Decisions Made\n\
+[Numbered list. Every decision or agreement reached so far ('we'll go with X', chosen \
+approach, agreed constraint) with a brief why. PRESERVE all previous entries and their \
+numbering exactly; only append.]\n\
+## Current Task Progress\n\
+[The live coding/system-design problem, if any: requirements and constraints given, what's \
+been covered, what remains.]\n\
+## Questions Already Covered\n\
+[One line each: questions the interviewer asked that were already answered.]\n\
+## Candidate Claims\n\
+[What the candidate has stated about themselves: experience, projects, numbers, \
+technologies. Keep names and figures verbatim.]\n\
+## Interviewer Signals\n\
+[Name/role if known, evaluation criteria they stated, topics probed more than once, threads \
+left open.]\n\
+## Language\n\
+[english | spanish | mixed]\n\
+Rules: preserve ALL still-relevant information from the previous document (update, don't \
+re-summarize); when an Active Question gets resolved, move it into 'Questions Already \
+Covered'; keep technology names, numbers and identifiers exactly as said; stay under ~600 \
+words total; be concrete. Never output anything but the document.";
+
 // Several shots are described PER IMAGE ("Image N: …"), with scroll-stitching
 // as the conditional case. The old wording asserted the shots were "consecutive
 // scrolls of the SAME page" — with unrelated shots that false premise both drew
@@ -124,6 +252,15 @@ const VISION_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(25);
 /// runs 1500-2500 tokens; the old 700 silently truncated it, breaking the
 /// "transcribe verbatim and complete" contract.
 const VISION_MAX_OUT: u32 = 2500;
+/// Agent-press first-token budget. gpt-5.5 reasons before the first visible
+/// token even at low effort; the ceiling also covers a cold prompt cache over
+/// a long transcript.
+const AGENT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(25);
+/// Visible-output ceiling for an agent answer (bullets or code).
+const AGENT_MAX_OUT: u32 = 1200;
+/// Interview State refresh: background call, latency uncritical.
+const STATE_TIMEOUT: Duration = Duration::from_secs(45);
+const STATE_MAX_OUT: u32 = 900;
 
 /// Result of one API answer turn.
 pub struct ApiOutcome {
@@ -132,6 +269,36 @@ pub struct ApiOutcome {
     pub total_ms: u64,
     /// Which provider actually answered, e.g. `groq/llama-3.1-8b-instant`.
     pub provider: String,
+}
+
+/// Token accounting from the final SSE chunk (`stream_options.include_usage`).
+/// `cached` ⊆ `prompt`: the prefix `OpenAI` billed at ~10% — the live check
+/// that the append-only transcript discipline is paying off.
+#[derive(Clone, Copy, Default)]
+pub struct TokenUsage {
+    pub prompt: u64,
+    pub cached: u64,
+    pub completion: u64,
+}
+
+/// Result of one agent press.
+pub struct AgentOutcome {
+    pub answer: String,
+    pub ttft_ms: u64,
+    pub total_ms: u64,
+    pub model: &'static str,
+    pub usage: TokenUsage,
+    /// `OpenAI`'s `x-request-id` response header — what their support asks for,
+    /// and the disambiguator between retries when reading traces.
+    pub request_id: Option<String>,
+}
+
+/// Extract `OpenAI`'s `x-request-id` header before the response body is consumed.
+fn openai_request_id(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 /// Result of one vision describe turn.
@@ -375,7 +542,7 @@ impl ApiBackend {
         .await
         .map_err(|_| anyhow!("connect timed out"))??;
 
-        let (answer, ttft_ms, total_ms) =
+        let (answer, ttft_ms, total_ms, _usage) =
             stream_sse_content(resp, "answer-delta", trace_id, app, t0, FIRST_TOKEN_TIMEOUT)
                 .await?;
         Ok(ApiOutcome {
@@ -435,7 +602,7 @@ impl ApiBackend {
         .await
         .map_err(|_| anyhow!("connect timed out"))??;
 
-        let (text, ttft_ms, total_ms) = stream_sse_content(
+        let (text, ttft_ms, total_ms, _usage) = stream_sse_content(
             resp,
             "vision-delta",
             trace_id,
@@ -463,6 +630,145 @@ impl ApiBackend {
             total_ms,
         })
     }
+
+    /// Agent press: answer from the FULL rolling transcript + Interview State,
+    /// streaming `answer-delta` events. `OpenAI`-only — the agent wants a strong
+    /// model, so `Auto` (the speed-first auto-answer chain) resolves to gpt-5.5;
+    /// a pinned gpt-4o-mini is honored.
+    pub async fn ask_agent(
+        &self,
+        transcript: &str,
+        state_block: &str,
+        language: Language,
+        brain: BrainModel,
+        trace_id: &str,
+        app: &AppHandle,
+    ) -> Result<AgentOutcome> {
+        let key = self
+            .openai
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent mode needs OPENAI_API_KEY (not set)"))?;
+        let model = match brain {
+            BrainModel::Gpt4oMini => "gpt-4o-mini",
+            BrainModel::Auto | BrainModel::Gpt55 => "gpt-5.5",
+        };
+        let body = agent_body(
+            model,
+            agent_system(language),
+            transcript,
+            &agent_tail(state_block, language),
+        );
+        let t0 = Instant::now();
+        let resp = tokio::time::timeout(
+            AGENT_FIRST_TOKEN_TIMEOUT,
+            self.client
+                .post(OPENAI_URL)
+                .bearer_auth(key.expose_secret())
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow!("connect timed out"))??;
+        let request_id = openai_request_id(&resp);
+        let (answer, ttft_ms, total_ms, usage) = stream_sse_content(
+            resp,
+            "answer-delta",
+            trace_id,
+            app,
+            t0,
+            AGENT_FIRST_TOKEN_TIMEOUT,
+        )
+        .await?;
+        Ok(AgentOutcome {
+            answer,
+            ttft_ms,
+            total_ms,
+            model,
+            usage,
+            request_id,
+        })
+    }
+
+    /// One Interview State update on the cheap sibling model (non-streaming,
+    /// background). Returns `(new state document, x-request-id)`.
+    pub async fn refresh_interview_state(
+        &self,
+        prev_state: &str,
+        delta: &str,
+    ) -> Result<(String, Option<String>)> {
+        let key = self
+            .openai
+            .as_ref()
+            .ok_or_else(|| anyhow!("state refresh needs OPENAI_API_KEY (not set)"))?;
+        let prev = if prev_state.is_empty() {
+            "(none yet — first update of this interview)"
+        } else {
+            prev_state
+        };
+        let user = format!("Previous state document:\n{prev}\n\nNew transcript lines:\n{delta}");
+        let mut body = chat_body(STATE_MODEL, STATE_SYS, json!(user), STATE_MAX_OUT, 0.2);
+        body["stream"] = json!(false);
+        body["reasoning_effort"] = json!("low");
+        let resp = tokio::time::timeout(
+            STATE_TIMEOUT,
+            self.client
+                .post(OPENAI_URL)
+                .bearer_auth(key.expose_secret())
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow!("state refresh timed out"))??;
+        let request_id = openai_request_id(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            bail!("HTTP {status}: {snippet}");
+        }
+        let v: Value = resp.json().await?;
+        let text = v
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            bail!("state refresh returned empty content");
+        }
+        Ok((text, request_id))
+    }
+}
+
+/// The agent request body. Three messages: [static system] + [transcript] +
+/// [volatile tail]. The ORDER is load-bearing: system+transcript form a
+/// stable, append-only prefix that `OpenAI`'s automatic prompt caching bills at
+/// ~10% from the second press on (and cuts TTFT); only the tiny tail changes
+/// per press. Never insert anything between system and transcript, and never
+/// rewrite old transcript lines — either invalidates the whole cache.
+fn agent_body(model: &str, system: &str, transcript: &str, tail: &str) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": transcript},
+            {"role": "user", "content": tail},
+        ],
+        "stream": true,
+        // Final pre-[DONE] chunk carries token usage incl. cached_tokens —
+        // the debug panel's context/cache meter.
+        "stream_options": {"include_usage": true},
+    });
+    if model.starts_with("gpt-5") {
+        body["max_completion_tokens"] = json!(AGENT_MAX_OUT + 2048);
+        // Latency over depth: the user is live in an interview. "low" keeps
+        // gpt-5.5 fast while far above the auto-answer chain's quality.
+        body["reasoning_effort"] = json!("low");
+    } else {
+        body["max_tokens"] = json!(AGENT_MAX_OUT);
+        body["temperature"] = json!(0.4);
+    }
+    body
 }
 
 /// Heuristic: a tiny completion whose text apologizes is a refusal, not a
@@ -508,7 +814,9 @@ fn chat_body(
 }
 
 /// Drain an `OpenAI`-style SSE `chat/completions` stream, emitting each content
-/// delta as `event_name` to the frontend. Returns `(full_text, ttft_ms, total_ms)`.
+/// delta as `event_name` to the frontend. Returns `(full_text, ttft_ms, total_ms,
+/// usage)` — usage stays zeroed unless the request asked for
+/// `stream_options.include_usage` (the agent path does).
 /// Errors before the first token so the caller can cascade; commits after it.
 async fn stream_sse_content(
     resp: reqwest::Response,
@@ -517,7 +825,7 @@ async fn stream_sse_content(
     app: &AppHandle,
     t0: Instant,
     first_token_timeout: Duration,
-) -> Result<(String, u64, u64)> {
+) -> Result<(String, u64, u64, TokenUsage)> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -530,6 +838,7 @@ async fn stream_sse_content(
     let mut text = String::new();
     let mut ttft_ms = 0_u64;
     let mut got_first = false;
+    let mut usage = TokenUsage::default();
 
     loop {
         let timeout = if got_first {
@@ -571,11 +880,28 @@ async fn stream_sse_content(
                     text.trim().to_string(),
                     if ttft_ms == 0 { total_ms } else { ttft_ms },
                     total_ms,
+                    usage,
                 ));
             }
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
+            // With include_usage, the final pre-[DONE] chunk carries usage and
+            // empty choices; regular chunks carry `"usage": null` — skip those.
+            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                usage.prompt = u
+                    .pointer("/prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.completion = u
+                    .pointer("/completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.cached = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+            }
             if let Some(delta) = v
                 .pointer("/choices/0/delta/content")
                 .and_then(Value::as_str)
@@ -603,7 +929,7 @@ async fn stream_sse_content(
         bail!("stream produced no content");
     }
     let total_ms = elapsed_ms(t0);
-    Ok((text.trim().to_string(), ttft_ms, total_ms))
+    Ok((text.trim().to_string(), ttft_ms, total_ms, usage))
 }
 
 fn build_user(question: &str, context: &str, language: Language) -> String {

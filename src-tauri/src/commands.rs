@@ -304,6 +304,115 @@ pub async fn ask_brain(
     Ok(outcome.answer)
 }
 
+/// Agent press (Ctrl+Shift+Space): answer from the FULL rolling transcript +
+/// Interview State, letting the model infer what help is needed — no question
+/// heuristics involved. Streams `answer-delta` events like `ask_brain`.
+#[tauri::command]
+#[tracing::instrument(skip(state, app), fields(trace_id = trace_id.as_deref().unwrap_or("-")))]
+pub async fn ask_agent(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    trace_id: Option<String>,
+) -> Result<String, AppError> {
+    let trace_id = trace_id.unwrap_or_else(|| "-".into());
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let brain = state
+        .brain_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+
+    let (transcript, transcript_lines) = state.agent.transcript_text();
+    if transcript.is_empty() {
+        return Err(AppError::Llm(
+            "nothing transcribed yet — the agent has no context to work from".into(),
+        ));
+    }
+    let state_block = state.agent.state_block();
+
+    #[cfg(debug_assertions)]
+    dump_agent_prompt(&trace_id, &transcript, &state_block);
+
+    let outcome = state
+        .api
+        .ask_agent(&transcript, &state_block, language, brain, &trace_id, &app)
+        .await
+        .map_err(|e| AppError::Llm(e.to_string()))?;
+
+    let m = &state.metrics;
+    m.last_llm_ms.store(outcome.total_ms, Ordering::Relaxed);
+    m.last_llm_ttft_ms.store(outcome.ttft_ms, Ordering::Relaxed);
+    m.agent_prompt_tokens
+        .store(outcome.usage.prompt, Ordering::Relaxed);
+    m.agent_cached_tokens
+        .store(outcome.usage.cached, Ordering::Relaxed);
+    m.agent_completion_tokens
+        .store(outcome.usage.completion, Ordering::Relaxed);
+    set_provider(&state, &format!("agent/{}", outcome.model));
+
+    // The one JSONL line that reconstructs a press: prompt shape, cache hit
+    // rate (cached_tokens is THE health check that the append-only prompt
+    // layout keeps paying), latency, and the full answer. Pair with the
+    // debug-build prompt dump for byte-exact repro.
+    tracing::info!(
+        target: "agent",
+        trace_id = %trace_id,
+        model = outcome.model,
+        transcript_lines,
+        transcript_chars = transcript.len(),
+        state_chars = state_block.len(),
+        prompt_tokens = outcome.usage.prompt,
+        cached_tokens = outcome.usage.cached,
+        completion_tokens = outcome.usage.completion,
+        ttft_ms = outcome.ttft_ms,
+        total_ms = outcome.total_ms,
+        request_id = outcome.request_id.as_deref().unwrap_or("-"),
+        answer = %outcome.answer,
+        "agent press answered"
+    );
+
+    #[cfg(debug_assertions)]
+    append_agent_answer(&trace_id, &outcome.answer);
+
+    // A press is a natural moment to catch a stale state up, in the background
+    // — never blocking the answer (which already streamed).
+    crate::agent::refresh_if_stale(&app);
+    Ok(outcome.answer)
+}
+
+/// Debug builds only: persist the exact agent prompt (transcript + state) to
+/// `logs/agent-prompts/`, so "why did it answer THIS?" can be answered offline
+/// against the API with the very same input.
+#[cfg(debug_assertions)]
+fn dump_agent_prompt(trace_id: &str, transcript: &str, state_block: &str) {
+    let dir = crate::telemetry::logs_dir().join("agent-prompts");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{trace_id}.md"));
+    let content = format!("# transcript\n\n{transcript}\n\n# interview state\n\n{state_block}\n");
+    if std::fs::write(&path, content).is_ok() {
+        tracing::info!(path = %path.display(), "agent prompt dumped (debug build)");
+    }
+}
+
+/// Debug builds only: complete the dump with the answer, so each file under
+/// `logs/agent-prompts/` holds the full input→output pair of one press.
+#[cfg(debug_assertions)]
+fn append_agent_answer(trace_id: &str, answer: &str) {
+    use std::io::Write;
+    let path = crate::telemetry::logs_dir()
+        .join("agent-prompts")
+        .join(format!("{trace_id}.md"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+        _ = writeln!(f, "\n# answer\n\n{answer}");
+    }
+}
+
 /// Generate an interviewer question with TTS (Kokoro→OpenAI), save it as a WAV,
 /// log it to the JSONL, and play it through the default output device. Used by
 /// the "Simulate interviewer" button to exercise the full capture→STT→LLM loop.
@@ -514,6 +623,7 @@ pub async fn describe_queue(
     if let Ok(mut d) = state.last_description.lock() {
         d.clone_from(&outcome.text);
     }
+    crate::agent::push_line(&app, "screen", &outcome.text);
     state
         .metrics
         .last_vision_ms
@@ -630,8 +740,11 @@ pub fn get_brain_model(state: tauri::State<'_, AppState>) -> Result<String, AppE
 /// re-ingesting the same clip on purpose must work — but the dedup state is
 /// updated so a later auto-clip of the same text stays quiet.
 #[tauri::command]
-#[tracing::instrument(skip(state))]
-pub async fn copy_and_ingest(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+#[tracing::instrument(skip(state, app))]
+pub async fn copy_and_ingest(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, AppError> {
     state.manual_copy.store(true, Ordering::SeqCst);
     let result =
         tauri::async_runtime::spawn_blocking(crate::clipboard::copy_selection_and_read).await;
@@ -647,6 +760,7 @@ pub async fn copy_and_ingest(state: tauri::State<'_, AppState>) -> Result<String
     if let Ok(mut last) = state.last_clip.lock() {
         last.clone_from(&text);
     }
+    crate::agent::push_line(&app, "clipboard", &text);
     tracing::info!(chars = text.len(), "clipboard ingested (manual copy)");
     Ok(text)
 }

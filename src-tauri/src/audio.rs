@@ -540,6 +540,7 @@ pub async fn capture_and_transcribe(
                                 "speaker": speaker,
                             });
                             app.emit("transcription", payload).ok();
+                            crate::agent::push_line(&app, speaker, &trimmed);
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "transcription failed"),
@@ -818,6 +819,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
                         "speaker": speaker,
                     });
                     app.emit("transcription", payload).ok();
+                    crate::agent::push_line(app, speaker, &final_text);
                 }
             } else if had_speech {
                 tracing::debug!(
