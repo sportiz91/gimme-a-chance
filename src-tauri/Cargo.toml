@@ -73,6 +73,11 @@ realfft = { version = "3", optional = true }
 crossbeam-channel = "0.5"
 bytemuck = { version = "1", features = ["derive"] }
 hound = "3"
+# Meeting persistence: every final transcript line, describe, clip and Q&A is
+# appended to a local SQLite session log (WAL) by a dedicated writer thread —
+# see storage.rs. `bundled` compiles SQLite in: no system dependency. Pinned
+# at 0.37: rusqlite 0.40's libsqlite3-sys needs `cfg_select!` (rustc > 1.94).
+rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = "0.4"
 dirs-next = "2"
 thiserror = "2"

@@ -22,7 +22,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 
-use crate::AppState;
+use crate::{storage, AppState};
 
 /// New-transcript budget between state refreshes: ~10K chars ≈ 2.5K tokens
 /// ≈ 10-12 minutes of speech. An absolute-delta trigger, deliberately NOT a
@@ -88,10 +88,11 @@ impl Default for AgentSession {
 }
 
 impl AgentSession {
-    /// Append a line; returns true when enough new transcript accumulated
-    /// that an Interview State refresh is due.
-    fn push(&self, speaker: &'static str, text: &str) -> bool {
-        let t_s = self.started.elapsed().as_secs();
+    /// Append a line; returns the line's session clock (`t_s`) plus whether
+    /// enough new transcript accumulated that an Interview State refresh is
+    /// due.
+    fn push(&self, speaker: &'static str, text: &str) -> (u64, bool) {
+        let t_s = self.elapsed_s();
         if let Ok(mut lines) = self.lines.lock() {
             lines.push(TranscriptLine {
                 speaker,
@@ -103,7 +104,15 @@ impl AgentSession {
             .chars_total
             .fetch_add(text.len() as u64, Ordering::Relaxed)
             + text.len() as u64;
-        total.saturating_sub(self.chars_at_refresh.load(Ordering::Relaxed)) >= REFRESH_DELTA_CHARS
+        let due = total.saturating_sub(self.chars_at_refresh.load(Ordering::Relaxed))
+            >= REFRESH_DELTA_CHARS;
+        (t_s, due)
+    }
+
+    /// Seconds since the session started — the transcript's `t_s` clock.
+    /// Also stamps the non-transcript persisted events (questions, answers).
+    pub fn elapsed_s(&self) -> u64 {
+        self.started.elapsed().as_secs()
     }
 
     /// The full transcript as prompt text, `[mm:ss] Label: text` per line
@@ -177,12 +186,32 @@ fn now_epoch_s() -> u64 {
 /// clipboard) and kick a background state refresh when one is due. Callable
 /// from any thread — Tauri's async runtime handle is global.
 pub fn push_line(app: &AppHandle, speaker: &'static str, text: &str) {
+    let kind = match speaker {
+        "screen" => "screen",
+        "clipboard" => "clipboard",
+        _ => "transcript",
+    };
+    push_line_tagged(app, speaker, kind, text);
+}
+
+/// [`push_line`] with an explicit persistence `kind`: the stealth selection
+/// grab (Ctrl+Shift+V) tags its lines `clipboard_stealth` so the session log
+/// tells the two clipboard paths apart, while the prompt label stays
+/// "Clipboard" for both.
+pub fn push_line_tagged(app: &AppHandle, speaker: &'static str, kind: &'static str, text: &str) {
     let text = text.trim();
     if text.is_empty() {
         return;
     }
     let state = app.state::<AppState>();
-    let due = state.agent.push(speaker, text);
+    let (t_s, due) = state.agent.push(speaker, text);
+    storage::record(storage::Event {
+        kind,
+        speaker: (kind == "transcript").then_some(speaker),
+        content: text.to_string(),
+        t_s,
+        meta: None,
+    });
     state.metrics.transcript_chars.store(
         state.agent.chars_total.load(Ordering::Relaxed),
         Ordering::Relaxed,

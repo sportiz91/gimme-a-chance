@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::audio;
 use crate::error::AppError;
+use crate::storage;
 use crate::AppState;
 
 #[tauri::command]
@@ -275,9 +276,23 @@ pub async fn ask_brain(
     trace_id: Option<String>,
     question: String,
     context: String,
+    manual: Option<bool>,
 ) -> Result<String, AppError> {
     let metrics = Arc::clone(&state.metrics);
     let trace_id = trace_id.unwrap_or_else(|| "-".into());
+    // Only questions typed into the Ask box get their own `question` event;
+    // auto-answers' detected questions are already interviewer transcript
+    // lines, so they only ride along in the answer's meta below.
+    let manual = manual.unwrap_or(false);
+    if manual {
+        storage::record(storage::Event {
+            kind: "question",
+            speaker: None,
+            content: question.clone(),
+            t_s: state.agent.elapsed_s(),
+            meta: Some(serde_json::json!({ "trace_id": trace_id })),
+        });
+    }
     let language = state
         .language
         .lock()
@@ -301,6 +316,18 @@ pub async fn ask_brain(
         .last_llm_ttft_ms
         .store(outcome.ttft_ms, Ordering::Relaxed);
     set_provider(&state, &outcome.provider);
+    storage::record(storage::Event {
+        kind: "answer",
+        speaker: None,
+        content: outcome.answer.clone(),
+        t_s: state.agent.elapsed_s(),
+        meta: Some(serde_json::json!({
+            "trace_id": trace_id,
+            "trigger": if manual { "ask" } else { "auto" },
+            "provider": outcome.provider,
+            "question": question,
+        })),
+    });
     Ok(outcome.answer)
 }
 
@@ -374,6 +401,21 @@ pub async fn ask_agent(
         answer = %outcome.answer,
         "agent press answered"
     );
+
+    storage::record(storage::Event {
+        kind: "answer",
+        speaker: None,
+        content: outcome.answer.clone(),
+        t_s: state.agent.elapsed_s(),
+        meta: Some(serde_json::json!({
+            "trace_id": trace_id,
+            "trigger": "agent",
+            "model": outcome.model,
+            "prompt_tokens": outcome.usage.prompt,
+            "cached_tokens": outcome.usage.cached,
+            "completion_tokens": outcome.usage.completion,
+        })),
+    });
 
     #[cfg(debug_assertions)]
     append_agent_answer(&trace_id, &outcome.answer);
@@ -760,7 +802,7 @@ pub async fn copy_and_ingest(
     if let Ok(mut last) = state.last_clip.lock() {
         last.clone_from(&text);
     }
-    crate::agent::push_line(&app, "clipboard", &text);
+    crate::agent::push_line_tagged(&app, "clipboard", "clipboard_stealth", &text);
     tracing::info!(chars = text.len(), "clipboard ingested (manual copy)");
     Ok(text)
 }

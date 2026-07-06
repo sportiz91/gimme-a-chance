@@ -730,7 +730,7 @@
         const context = contextLines
           .map(l => (SOURCE[l.speaker] || 'Interviewer') + ': ' + l.text)
           .join('\n');
-        const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
+        const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context, manual: !traceId });
         const elapsed_ms = Math.round(performance.now() - t0);
         responseEl.classList.remove('loading');
         responseEl.textContent = answer;

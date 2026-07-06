@@ -17,6 +17,7 @@ mod lang;
 mod latency;
 mod metrics;
 mod secrets;
+mod storage;
 #[cfg(feature = "sherpa")]
 mod stt;
 mod telemetry;
@@ -178,6 +179,14 @@ pub fn run() {
         allocator = metrics::active_allocator_name(),
         "gimme-a-chance starting"
     );
+
+    // Meeting persistence: open sessions.sqlite, insert this run's session
+    // row, spawn the writer thread. Before the builder so no early producer
+    // (the clipboard watcher, a fast Listen) can beat it. A failure only
+    // warns — a broken database must never keep the copilot from starting.
+    if let Err(e) = storage::init() {
+        tracing::warn!(error = %e, "session persistence unavailable");
+    }
 
     // Ctrl+Shift+H toggles the overlay's visibility (same binding as screen-peek).
     let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyH);
@@ -408,11 +417,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            // When Tauri signals the process is about to exit, drop the dhat
-            // profiler explicitly so its JSON gets written. This runs BEFORE
-            // winit/tao calls std::process::exit(), giving us our last chance.
-            #[cfg(feature = "dhat-heap")]
+            // This runs BEFORE winit/tao calls std::process::exit() (which
+            // skips destructors) — the last chance to flush anything to disk.
             if matches!(event, tauri::RunEvent::Exit) {
+                // Drain the session log and stamp the session's `ended_at`.
+                storage::shutdown();
+                // Drop the dhat profiler explicitly so its JSON gets written.
+                #[cfg(feature = "dhat-heap")]
                 if let Some(mu) = DHAT_PROFILER.get() {
                     if let Ok(mut guard) = mu.lock() {
                         if let Some(profiler) = guard.take() {
@@ -422,7 +433,5 @@ pub fn run() {
                     }
                 }
             }
-            #[cfg(not(feature = "dhat-heap"))]
-            let _ = event;
         });
 }
