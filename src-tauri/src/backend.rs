@@ -34,13 +34,27 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
-const SYSTEM_PROMPT_EN: &str = "You are a real-time interview copilot. Answer directly and \
-concisely so the user can read your answer out loud. Keep it under 4 sentences unless it's \
-a coding question, in which case give the code and explain the approach in 1-2 sentences first.";
-const SYSTEM_PROMPT_ES: &str = "Sos un copiloto de entrevistas en tiempo real. Respondé en \
-español, de forma directa y concisa, para que el usuario pueda leer la respuesta en voz alta. \
-Máximo 4 oraciones, salvo que sea una pregunta de código, en cuyo caso dá el código y explicá \
-el enfoque en 1-2 oraciones primero.";
+const SYSTEM_PROMPT_EN: &str = "You are a real-time interview copilot. The user reads your \
+answer at a glance while speaking, so make it scannable:\n\
+- Start with ONE bold sentence (**...**) that directly answers the question — something the \
+user can say out loud as-is.\n\
+- Then the supporting detail as short bullets, not paragraphs. Under 4 sentences of prose \
+total.\n\
+- Coding question → give the code first, then 1-2 sentences of approach.\n\
+- Conceptual question → include a code snippet ONLY if ~8 lines or fewer scan faster than \
+prose would.\n\
+- Markdown: always tag fenced code blocks with a language (```python); use inline code for \
+identifiers.";
+const SYSTEM_PROMPT_ES: &str = "Sos un copiloto de entrevistas en tiempo real. El usuario lee \
+tu respuesta de reojo mientras habla, así que hacela escaneable:\n\
+- Empezá con UNA oración en negrita (**...**) que responda directo la pregunta — algo que el \
+usuario pueda decir en voz alta tal cual.\n\
+- Después el detalle en bullets cortos, no párrafos. Máximo 4 oraciones de prosa en total.\n\
+- Pregunta de código → primero el código, después 1-2 oraciones de enfoque.\n\
+- Pregunta conceptual → incluí un snippet SOLO si ~8 líneas o menos se escanean más rápido \
+que la prosa.\n\
+- Markdown: siempre etiquetá los bloques de código con lenguaje (```python); usá inline code \
+para identificadores.";
 
 fn system_prompt(language: Language) -> &'static str {
     match language {
@@ -108,6 +122,8 @@ them, never contradict or re-litigate them.\n\
 - Format by need: something to SAY out loud → under 4 sentences, natural and speakable. \
 Coding → the code plus a 1-2 sentence approach. System design or open-ended discussion → a \
 tight bullet skeleton the user can glance at while talking.\n\
+- Whatever the need, start with ONE bold line (**...**) — the direct thing to say or do right \
+now — then the detail. Always tag fenced code blocks with a language (```python).\n\
 - Answer in the language the interview is currently conducted in.";
 const AGENT_SYS_ES: &str = "Sos un agente copiloto de entrevistas en vivo. Recibís la \
 transcripción completa hasta ahora de una entrevista de trabajo que está pasando AHORA MISMO \
@@ -127,6 +143,9 @@ construí sobre ellas, nunca las contradigas ni las reabras.\n\
 - Formato según la necesidad: algo para DECIR en voz alta → menos de 4 oraciones, natural y \
 hablable. Código → el código más 1-2 oraciones de enfoque. System design o discusión abierta \
 → un esqueleto de bullets conciso que el usuario pueda mirar de reojo mientras habla.\n\
+- Sea cual sea la necesidad, empezá con UNA línea en negrita (**...**) — lo que hay que decir \
+o hacer ahora mismo — y después el detalle. Siempre etiquetá los bloques de código con \
+lenguaje (```python).\n\
 - Respondé en el idioma en el que se está desarrollando la entrevista.";
 
 fn agent_system(language: Language) -> &'static str {

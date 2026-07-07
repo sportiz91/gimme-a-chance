@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>gimme — answer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body { height: 100%; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: rgba(15, 15, 15, 0.92);
+      color: #e0e0e0;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .titlebar {
+      height: 32px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      background: rgba(30, 30, 30, 0.95);
+      cursor: grab;
+    }
+    .titlebar:active { cursor: grabbing; }
+    .titlebar span { font-size: 11px; opacity: 0.5; }
+    .titlebar button {
+      padding: 0 8px;
+      border: none;
+      background: transparent;
+      color: #e0e0e0;
+      font-size: 14px;
+      line-height: 24px;
+      cursor: pointer;
+      opacity: 0.6;
+    }
+    .titlebar button:hover { opacity: 1; }
+
+    /* Same markdown styling as the main window's Answer box, one size up —
+       this window exists to be read from a distance. */
+    #answer {
+      flex: 1;
+      overflow-y: auto;
+      font-size: 16px;
+      line-height: 1.6;
+      padding: 14px 16px;
+      word-wrap: break-word;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    #answer p { margin: 0.5em 0; }
+    #answer p:first-child { margin-top: 0; }
+    #answer ul, #answer ol { margin: 0.4em 0; padding-left: 1.4em; }
+    #answer li { margin: 0.2em 0; }
+    #answer h1, #answer h2, #answer h3, #answer h4 {
+      font-size: 1.05em;
+      margin: 0.7em 0 0.3em;
+    }
+    #answer code {
+      font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: rgba(255, 255, 255, 0.09);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+    }
+    #answer pre {
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 10px;
+      margin: 0.6em 0;
+    }
+    #answer pre code,
+    #answer pre code.hljs {
+      display: block;
+      background: transparent;
+      padding: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #answer:empty::after {
+      content: 'The answer streams here…';
+      opacity: 0.3;
+      font-style: italic;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    #answer.loading::after {
+      content: 'Thinking...';
+      opacity: 0.5;
+      animation: pulse 1s infinite;
+    }
+  </style>
+  <link rel="stylesheet" href="highlight-github-dark.min.css" />
+  <script src="highlight.min.js"></script>
+  <script type="module">
+    import * as smd from './smd.js';
+    window.smd = smd;
+  </script>
+</head>
+<body>
+  <div class="titlebar" data-tauri-drag-region>
+    <span>Answer</span>
+    <button id="closeBtn" title="Close">✕</button>
+  </div>
+  <div id="answer"></div>
+
+  <script>
+    // Pop-out mirror of the main window's Answer box. The main window relays
+    // its own (already trace-gated) render calls as `answer-mirror` events:
+    // reset → delta* → final | error. Same smd/hljs pipeline, no auto-scroll.
+    const { listen, emit } = window.__TAURI__.event;
+    const box = document.getElementById('answer');
+    let parser = null;
+    let raw = '';
+
+    function renderFull(text) {
+      box.innerHTML = '';
+      parser = null;
+      if (window.smd) {
+        const p = window.smd.parser(window.smd.default_renderer(box));
+        window.smd.parser_write(p, text);
+        window.smd.parser_end(p);
+      } else {
+        box.textContent = text;
+      }
+      if (window.hljs) {
+        box.querySelectorAll('pre code').forEach(b => window.hljs.highlightElement(b));
+      }
+    }
+
+    listen('answer-mirror', (event) => {
+      const { kind, text, loading } = event.payload;
+      box.classList.toggle('loading', kind === 'reset' && !!loading);
+      if (kind === 'reset') {
+        raw = '';
+        parser = null;
+        box.innerHTML = '';
+        box.scrollTop = 0;
+      } else if (kind === 'delta') {
+        raw += text;
+        if (!window.smd) { box.textContent = raw; return; }
+        if (!parser) parser = window.smd.parser(window.smd.default_renderer(box));
+        window.smd.parser_write(parser, text);
+      } else if (kind === 'final') {
+        raw = text;
+        renderFull(text);
+      } else if (kind === 'error') {
+        raw = '';
+        parser = null;
+        box.textContent = text;
+      }
+    });
+
+    // Hide, never close: the window is pre-created once at startup and the
+    // ⛶ button in the main window re-shows it.
+    document.getElementById('closeBtn').addEventListener('click', () => {
+      window.__TAURI__.window.getCurrentWindow().hide();
+    });
+
+    // Ask the main window for the current answer state (covers opening the
+    // pop-out mid-stream or after an answer already completed).
+    emit('answer-window-ready', {});
+  </script>
+</body>
+</html>

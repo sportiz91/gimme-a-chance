@@ -7,6 +7,10 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    /* Answer readability knob — bump for high-DPI screens or bad eyesight
+       days without touching the rest of the (context) boxes. */
+    :root { --response-font-size: 15px; }
+
     body {
       font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
       background: rgba(15, 15, 15, 0.85);
@@ -35,7 +39,12 @@
       display: flex;
       flex-direction: column;
       gap: 10px;
+      /* Fill the window below the 32px titlebar so the Answer box (flex: 1)
+         absorbs all free height; everything else keeps its content size. */
+      height: calc(100vh - 32px);
+      overflow-y: auto;
     }
+    .container > :not(#response) { flex-shrink: 0; }
 
     /* Controls */
     .controls {
@@ -55,10 +64,27 @@
       transition: background 0.15s;
     }
     button:hover { background: rgba(255,255,255,0.15); }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
     button.active {
       background: rgba(76, 175, 80, 0.3);
       border-color: rgba(76, 175, 80, 0.5);
     }
+    /* Tiny inline spinner for buttons whose action is in flight */
+    .spin {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border: 2px solid rgba(255, 255, 255, 0.25);
+      border-top-color: #e0e0e0;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: -1px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
     select {
       flex: 1;
@@ -68,6 +94,22 @@
       background: rgba(255,255,255,0.08);
       color: #e0e0e0;
       font-size: 12px;
+    }
+
+    /* Fixed-width control selects (was inline style=, blocked by style-src-attr) */
+    #sourceSelect { flex: 0 0 auto; max-width: 170px; }
+    #langSelect   { flex: 0 0 auto; max-width: 120px; }
+    #visionSelect { flex: 0 0 auto; max-width: 160px; }
+    #brainSelect  { flex: 0 0 auto; max-width: 190px; }
+    #simPreset    { flex: 0 0 auto; max-width: 150px; }
+    .hidden { display: none; }
+    .check-label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      opacity: 0.7;
+      white-space: nowrap;
     }
 
     /* Status indicator */
@@ -88,6 +130,7 @@
       background: #4caf50;
       animation: pulse 1.5s infinite;
     }
+    .status .dot.error { background: #ef5350; }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.4; }
@@ -133,19 +176,53 @@
     /* Live partial hypothesis from the streaming STT engine */
     .partial { opacity: 0.55; font-style: italic; }
 
-    /* Answer area */
+    /* Answer area — THE box during an interview: dominant (flex: 1 in the
+       column), larger type, and rendered markdown instead of raw text. */
     #response {
+      flex: 1;
       min-height: 80px;
-      max-height: 260px;
       overflow-y: auto;
-      font-size: 13px;
+      font-size: var(--response-font-size);
       line-height: 1.6;
       padding: 10px;
       background: rgba(33, 150, 243, 0.08);
       border-radius: 6px;
       border: 1px solid rgba(33, 150, 243, 0.2);
-      white-space: pre-wrap;
       word-wrap: break-word;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    #response p { margin: 0.5em 0; }
+    #response p:first-child { margin-top: 0; }
+    #response ul, #response ol { margin: 0.4em 0; padding-left: 1.4em; }
+    #response li { margin: 0.2em 0; }
+    #response h1, #response h2, #response h3, #response h4 {
+      font-size: 1.05em;
+      margin: 0.7em 0 0.3em;
+    }
+    #response code {
+      font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: rgba(255, 255, 255, 0.09);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+    }
+    #response pre {
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 10px;
+      margin: 0.6em 0;
+    }
+    /* Long code lines WRAP instead of scrolling horizontally — panning code
+       mid-interview is unreadable; a folded line scans at a glance. */
+    #response pre code,
+    #response pre code.hljs {
+      display: block;
+      background: transparent;
+      padding: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     #response:empty::after {
       content: 'Answer will appear here...';
@@ -250,6 +327,15 @@
       margin-bottom: 4px;
     }
   </style>
+  <link rel="stylesheet" href="highlight-github-dark.min.css" />
+  <script src="highlight.min.js"></script>
+  <script type="module">
+    // smd.js (streaming-markdown) is an ES module; expose it for the classic
+    // main script below. Module scripts run deferred, but smd is only used
+    // from event handlers that can't fire before then (guarded regardless).
+    import * as smd from './smd.js';
+    window.smd = smd;
+  </script>
 </head>
 <body>
   <div class="titlebar" data-tauri-drag-region>
@@ -262,78 +348,81 @@
 
   <div class="container">
     <div class="controls">
-      <select id="sourceSelect" onchange="loadDevices()" title="Capture source" style="flex:0 0 auto; max-width:170px">
+      <select id="sourceSelect" title="Capture source">
         <option value="mic">🎙️ Microphone</option>
         <option value="loopback">🔊 System audio</option>
         <option value="both">🎙️+🔊 Both (interviewer + you)</option>
       </select>
       <select id="deviceSelect"></select>
-      <select id="langSelect" onchange="setLanguage()" title="Language (transcription + answers)" style="flex:0 0 auto; max-width:120px">
+      <select id="langSelect" title="Language (transcription + answers)">
         <option value="english">English</option>
         <option value="spanish">Español</option>
       </select>
-      <button id="listenBtn" onclick="toggleListening()">Listen</button>
-      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Also answer questions YOU ask via the mic">
+      <button id="listenBtn">Listen</button>
+      <label class="check-label" title="Also answer questions YOU ask via the mic">
         <input type="checkbox" id="answerMe"> answer me
       </label>
     </div>
 
     <div class="controls">
-      <select id="visionSelect" onchange="setVisionModel()" title="Vision model (describes the screen)" style="flex:0 0 auto; max-width:160px">
+      <select id="visionSelect" title="Vision model (describes the screen)">
         <option value="gpt_4o_mini">👁 gpt-4o-mini</option>
         <option value="gpt_5_5">👁 gpt-5.5</option>
       </select>
-      <select id="brainSelect" onchange="setBrainModel()" title="Brain model (answers)" style="flex:0 0 auto; max-width:190px">
+      <select id="brainSelect" title="Brain model (answers)">
         <option value="auto">🧠 Auto (Groq→OpenAI)</option>
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
       </select>
-      <button id="agentBtn" onclick="askAgent()" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space)">🤖 Agent</button>
-      <button id="addShotBtn" onclick="addShot()" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
-      <button id="describeBtn" onclick="describeQueue()" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
-      <button id="clearQueueBtn" onclick="clearQueue()" title="Discard queued shots" style="display:none">🗑</button>
-      <label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:0.7;white-space:nowrap" title="Ingest every copy as context; Ctrl+Shift+V copies the current selection and ingests it">
-        <input type="checkbox" id="autoClip" onchange="setAutoClip()" checked> 📋 auto-clip
+      <button id="agentBtn" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space)">🤖 Agent</button>
+      <button id="addShotBtn" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
+      <button id="describeBtn" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
+      <button id="clearQueueBtn" class="hidden" title="Discard queued shots">🗑</button>
+      <label class="check-label" title="Ingest every copy as context; Ctrl+Shift+V copies the current selection and ingests it">
+        <input type="checkbox" id="autoClip" checked> 📋 auto-clip
       </label>
     </div>
 
     <div class="section-label section-head">
       <span>Transcript</span>
-      <button onclick="clearTranscript()" title="Clear the transcript and drop its context">🗑</button>
+      <button id="clearTranscriptBtn" title="Clear the transcript and drop its context">🗑</button>
     </div>
     <div id="transcript"></div>
 
     <div class="section-label section-head">
       <span>Vision</span>
-      <button onclick="clearVision()" title="Clear the screen descriptions and drop their context">🗑</button>
+      <button id="clearVisionBtn" title="Clear the screen descriptions and drop their context">🗑</button>
     </div>
     <div id="vision"></div>
 
     <div class="section-label section-head">
       <span>Clipboard</span>
-      <button onclick="clearClipboard()" title="Clear the clipboard box and drop its context">🗑</button>
+      <button id="clearClipboardBtn" title="Clear the clipboard box and drop its context">🗑</button>
     </div>
     <div id="clipboard"></div>
 
-    <div class="section-label">Answer</div>
+    <div class="section-label section-head">
+      <span>Answer</span>
+      <button id="popOutBtn" title="Pop the answer out into a big resizable overlay">⛶</button>
+    </div>
     <div id="response"></div>
 
     <div class="ask-row">
-      <input id="askInput" type="text" placeholder="Ask manually..." onkeydown="if(event.key==='Enter')askBrain()" />
-      <button onclick="askBrain()">Ask</button>
+      <input id="askInput" type="text" placeholder="Ask manually..." />
+      <button id="askBtn">Ask</button>
     </div>
 
     <div class="section-label">Simulate interviewer (test)</div>
     <div class="ask-row">
-      <select id="simPreset" onchange="document.getElementById('simInput').value=this.value" style="flex:0 0 auto; max-width:150px">
+      <select id="simPreset">
         <option value="">Presets…</option>
         <option value="What is a rate limiter, and when would you use one?">Factual</option>
         <option value="How would you design a distributed rate limiter? Walk me through the trade-offs.">System design</option>
         <option value="Write a function that reverses a linked list, and explain the approach.">Coding</option>
         <option value="Tell me about a challenging project you worked on recently.">Behavioral</option>
       </select>
-      <input id="simInput" type="text" placeholder="Interviewer question to speak aloud..." onkeydown="if(event.key==='Enter')simulateInterviewer()" />
-      <button onclick="simulateInterviewer()">🔊 Speak</button>
+      <input id="simInput" type="text" placeholder="Interviewer question to speak aloud..." />
+      <button id="simBtn">🔊 Speak</button>
     </div>
   </div>
 
@@ -362,7 +451,7 @@
 
   <script>
     const { invoke } = window.__TAURI__.core;
-    const { listen } = window.__TAURI__.event;
+    const { listen, emit } = window.__TAURI__.event;
 
     let isListening = false;
     // Selected language ('english' | 'spanish'). Drives question detection below;
@@ -405,11 +494,121 @@
       }).catch((e) => console.error('log_from_frontend failed:', e));
     }
 
+    // Frontend failures are invisible (no console in release, hidden in
+    // detached debug runs) — forward them to the JSONL log. csp_violation
+    // matters most: a CSP-blocked handler/script fails silently otherwise.
+    window.addEventListener('error', (e) => {
+      log('error', 'js_error', { error: String(e.message), source: `${e.filename || ''}:${e.lineno || 0}` });
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      log('error', 'js_unhandled_rejection', { error: String(e.reason) });
+    });
+    document.addEventListener('securitypolicyviolation', (e) => {
+      log('error', 'csp_violation', {
+        directive: e.violatedDirective,
+        blocked: e.blockedURI,
+        sample: (e.sample || '').slice(0, 80),
+      });
+    });
+
     // Escape user/transcribed text before inserting as HTML (label rendering).
     function escapeHtml(s) {
       return s.replace(/[&<>"']/g, c => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
       ));
+    }
+
+    // ── Answer box: streaming markdown ─────────────────────────────────────
+    // smd.js keeps a stateful parser per answer: each delta is fed as-is
+    // (parser_write) and unclosed constructs (a ``` fence mid-stream) render
+    // as their final form from the first token. It builds DOM via text nodes,
+    // so model output can't inject HTML. Deliberately NO auto-scroll here:
+    // in an interview you read top-down while the tail grows below.
+    // Every render call is also relayed to the pop-out overlay (answer.html)
+    // as an `answer-mirror` event; answerRaw/answerDone let a late-opened
+    // overlay catch up with the current answer.
+    let answerParser = null;
+    let answerRaw = '';
+    let answerDone = false;
+
+    function mirrorAnswer(kind, text, loading) {
+      emit('answer-mirror', { kind, text: text || '', loading: !!loading }).catch(() => {});
+    }
+
+    function resetAnswer(loading) {
+      const el = document.getElementById('response');
+      answerParser = null;
+      answerRaw = '';
+      answerDone = false;
+      el.innerHTML = '';
+      el.scrollTop = 0;
+      el.classList.toggle('loading', !!loading);
+      mirrorAnswer('reset', '', loading);
+    }
+
+    function appendAnswer(text) {
+      const el = document.getElementById('response');
+      el.classList.remove('loading');
+      answerRaw += text;
+      mirrorAnswer('delta', text);
+      if (!window.smd) { el.textContent += text; return; }
+      if (!answerParser) {
+        answerParser = window.smd.parser(window.smd.default_renderer(el));
+      }
+      window.smd.parser_write(answerParser, text);
+    }
+
+    // The invoke's full answer is authoritative (deltas can be stale/dropped):
+    // re-render it whole, close the parser, then colorize code blocks once —
+    // highlighting mid-stream would fight smd's live text nodes.
+    function finishAnswer(fullText) {
+      const el = document.getElementById('response');
+      el.classList.remove('loading');
+      el.innerHTML = '';
+      answerParser = null;
+      answerRaw = fullText;
+      answerDone = true;
+      mirrorAnswer('final', fullText);
+      if (window.smd) {
+        const p = window.smd.parser(window.smd.default_renderer(el));
+        window.smd.parser_write(p, fullText);
+        window.smd.parser_end(p);
+      } else {
+        el.textContent = fullText;
+      }
+      if (window.hljs) {
+        el.querySelectorAll('pre code').forEach(b => window.hljs.highlightElement(b));
+      }
+    }
+
+    function errorAnswer(message) {
+      const el = document.getElementById('response');
+      el.classList.remove('loading');
+      el.innerHTML = '';
+      answerParser = null;
+      answerRaw = '';
+      answerDone = false;
+      el.textContent = message;
+      mirrorAnswer('error', message);
+    }
+
+    // A freshly opened pop-out announces itself; replay the current answer so
+    // it doesn't open blank mid-interview (streaming, finished, or thinking).
+    listen('answer-window-ready', () => {
+      const thinking = document.getElementById('response').classList.contains('loading');
+      mirrorAnswer('reset', '', thinking);
+      if (answerDone) {
+        mirrorAnswer('final', answerRaw);
+      } else if (answerRaw) {
+        mirrorAnswer('delta', answerRaw);
+      }
+    });
+
+    // Conditional bottom-pin for the context boxes (transcript/vision): follow
+    // new content only if the user was already reading the tail — never yank
+    // them back down while they scrolled up to re-read something.
+    function nearBottom(el) {
+      return el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
     }
 
     // Load audio devices
@@ -529,7 +728,7 @@
     function renderQueueBadge() {
       document.getElementById('describeBtn').textContent =
         queueCount > 0 ? `👁 Describe (${queueCount})` : '👁 Describe';
-      document.getElementById('clearQueueBtn').style.display = queueCount > 0 ? '' : 'none';
+      document.getElementById('clearQueueBtn').classList.toggle('hidden', queueCount === 0);
     }
 
     async function addShot() {
@@ -674,14 +873,22 @@
       catch (e) { console.error('set_auto_clip (init) failed:', e); }
     }
 
+    // Start/stop can take seconds (model loads, device init) — while the
+    // invoke is in flight the button is disabled and shows a spinner, and a
+    // failure lands in the status text instead of dying in the console.
     async function toggleListening() {
       const btn = document.getElementById('listenBtn');
+      if (btn.disabled) return; // re-clicked while a toggle is in flight
       const dot = document.getElementById('statusDot');
       const status = document.getElementById('statusText');
+      btn.disabled = true;
+      dot.classList.remove('error');
 
       if (!isListening) {
         const device = document.getElementById('deviceSelect').value;
         const source = document.getElementById('sourceSelect').value;
+        btn.innerHTML = '<span class="spin"></span>Starting…';
+        status.textContent = 'Starting...';
         try {
           await invoke('start_listening', { deviceName: device || null, source });
           isListening = true;
@@ -691,8 +898,12 @@
           status.textContent = 'Listening...';
         } catch (e) {
           console.error('Start failed:', e);
+          btn.textContent = 'Listen';
+          dot.classList.add('error');
+          status.textContent = 'Error: ' + e;
         }
       } else {
+        btn.innerHTML = '<span class="spin"></span>Stopping…';
         try {
           await invoke('stop_listening');
           isListening = false;
@@ -702,8 +913,12 @@
           status.textContent = 'Idle';
         } catch (e) {
           console.error('Stop failed:', e);
+          btn.textContent = 'Stop';
+          dot.classList.add('error');
+          status.textContent = 'Error: ' + e;
         }
       }
+      btn.disabled = false;
     }
 
     async function askBrain(question, traceId) {
@@ -718,9 +933,7 @@
       firstDeltaSeen = false;
       const t0 = performance.now();
 
-      const responseEl = document.getElementById('response');
-      responseEl.textContent = '';
-      responseEl.classList.add('loading');
+      resetAnswer(true);
       input.value = '';
 
       log('info', 'ask_start', { trace_id, manual: !traceId, question_len: q.length });
@@ -732,8 +945,7 @@
           .join('\n');
         const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context, manual: !traceId });
         const elapsed_ms = Math.round(performance.now() - t0);
-        responseEl.classList.remove('loading');
-        responseEl.textContent = answer;
+        finishAnswer(answer);
         log('info', 'ask_complete', { trace_id, elapsed_ms, answer_len: answer.length });
 
         // End-to-end: from transcription emit (backend) to painted answer (frontend).
@@ -744,8 +956,7 @@
         }
       } catch (e) {
         const elapsed_ms = Math.round(performance.now() - t0);
-        responseEl.classList.remove('loading');
-        responseEl.textContent = 'Error: ' + e;
+        errorAnswer('Error: ' + e);
         log('error', 'ask_failed', { trace_id, elapsed_ms, error: String(e) });
       }
     }
@@ -762,22 +973,18 @@
       activeTraceId = trace_id;
       firstDeltaSeen = false;
       const t0 = performance.now();
-      const responseEl = document.getElementById('response');
-      responseEl.textContent = '';
-      responseEl.classList.add('loading');
+      resetAnswer(true);
       log('info', 'agent_press', { trace_id });
       try {
         const answer = await invoke('ask_agent', { traceId: trace_id });
-        responseEl.classList.remove('loading');
-        responseEl.textContent = answer;
+        finishAnswer(answer);
         log('info', 'agent_complete', {
           trace_id,
           elapsed_ms: Math.round(performance.now() - t0),
           answer_len: answer.length,
         });
       } catch (e) {
-        responseEl.classList.remove('loading');
-        responseEl.textContent = 'Error: ' + e;
+        errorAnswer('Error: ' + e);
         log('error', 'agent_failed', {
           trace_id,
           elapsed_ms: Math.round(performance.now() - t0),
@@ -790,19 +997,16 @@
 
     // Stream the answer token-by-token as it arrives from the backend.
     // The final full answer still comes back from the `ask_brain` invoke (which
-    // reconciles `textContent`), but these deltas paint the first line in ~1s.
+    // reconciles via finishAnswer), but these deltas paint the first line in ~1s.
     listen('answer-delta', (event) => {
       const { trace_id, text } = event.payload;
       if (trace_id !== activeTraceId) return; // ignore stale deltas
-      const responseEl = document.getElementById('response');
-      responseEl.classList.remove('loading');
       if (!firstDeltaSeen && trace_id === lastTraceId && lastTraceStart > 0) {
         // First token = end-to-end "time to first word" for the debug panel.
         log('info', 'ttft', { trace_id, elapsed_ms: Math.round(performance.now() - lastTraceStart) });
       }
       firstDeltaSeen = true;
-      responseEl.textContent += text;
-      responseEl.scrollTop = responseEl.scrollHeight;
+      appendAnswer(text);
     });
 
     // Stream the screen description token-by-token as the vision model produces it.
@@ -811,8 +1015,20 @@
       if (trace_id !== activeVisionTraceId) return; // ignore stale deltas
       const el = document.getElementById('vision');
       el.className = '';
+      const follow = nearBottom(el);
       el.textContent += text;
-      el.scrollTop = el.scrollHeight;
+      if (follow) el.scrollTop = el.scrollHeight;
+    });
+
+    // STT model warm-up progress (startup / language switch). Only narrated
+    // while idle — it must never overwrite a live session's status text.
+    listen('stt-warmup', (event) => {
+      const { state } = event.payload;
+      const status = document.getElementById('statusText');
+      const btn = document.getElementById('listenBtn');
+      if (isListening || btn.disabled) return;
+      if (state === 'started') status.textContent = 'Warming models…';
+      else if (status.textContent === 'Warming models…') status.textContent = 'Idle';
     });
 
     // Global hotkeys, relayed by the backend.
@@ -841,8 +1057,9 @@
         }
       }
       const el = document.getElementById('transcript');
+      const follow = nearBottom(el);
       el.innerHTML = lines.join('<br>');
-      el.scrollTop = el.scrollHeight;
+      if (follow) el.scrollTop = el.scrollHeight;
     }
 
     // Live partials from the streaming STT engine. The hypothesis refines in
@@ -1036,6 +1253,37 @@
       debugPanel.classList.toggle('visible');
     });
 
+    // All UI handlers live here, NOT as inline on* attributes: the packaged
+    // CSP allows hashed inline <script>s but silently blocks attribute
+    // handlers, so an onclick= dies with no error. addEventListener is not
+    // CSP-gated. Functions that take optional args are wrapped so the event
+    // object never leaks into a parameter (e.g. askBrain(question, traceId)).
+    function wireHandlers() {
+      const on = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
+      on('sourceSelect', 'change', loadDevices);
+      on('langSelect', 'change', setLanguage);
+      on('listenBtn', 'click', toggleListening);
+      on('visionSelect', 'change', setVisionModel);
+      on('brainSelect', 'change', setBrainModel);
+      on('agentBtn', 'click', askAgent);
+      on('addShotBtn', 'click', addShot);
+      on('describeBtn', 'click', () => describeQueue());
+      on('clearQueueBtn', 'click', clearQueue);
+      on('autoClip', 'change', setAutoClip);
+      on('clearTranscriptBtn', 'click', clearTranscript);
+      on('clearVisionBtn', 'click', clearVision);
+      on('clearClipboardBtn', 'click', clearClipboard);
+      on('popOutBtn', 'click', () => {
+        invoke('open_answer_window').catch((e) => log('error', 'open_answer_window_failed', { error: String(e) }));
+      });
+      on('askBtn', 'click', () => askBrain());
+      on('askInput', 'keydown', (e) => { if (e.key === 'Enter') askBrain(); });
+      on('simBtn', 'click', simulateInterviewer);
+      on('simInput', 'keydown', (e) => { if (e.key === 'Enter') simulateInterviewer(); });
+      on('simPreset', 'change', (e) => { document.getElementById('simInput').value = e.target.value; });
+    }
+    wireHandlers();
+
     // Init — restore the last capture source before populating devices.
     const savedSource = localStorage.getItem('captureSource');
     if (savedSource) {
@@ -1047,6 +1295,13 @@
     initBrainModel();
     initQueue();
     initAutoClip();
+
+    // Boot check for the markdown pipeline: module scripts run after this one,
+    // so probe on `load`. smd/hljs false here means the vendored assets didn't
+    // load (CSP or missing file) and answers fell back to plain text.
+    window.addEventListener('load', () => {
+      log('info', 'renderer_ready', { smd: !!window.smd, hljs: !!window.hljs });
+    });
   </script>
 </body>
 </html>

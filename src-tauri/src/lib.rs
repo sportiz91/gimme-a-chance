@@ -285,6 +285,28 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // Pre-create the pop-out answer overlay HIDDEN. Building webview
+            // windows after the event loop is live hangs on Windows (wry left
+            // the webview half-initialized: white window, build() never
+            // returned) — setup-time creation is the reliable path, and it
+            // makes the ⛶ button instant (show/hide from then on).
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "answer",
+                tauri::WebviewUrl::App("answer.html".into()),
+            )
+            .title("gimme — answer")
+            .inner_size(720.0, 560.0)
+            .resizable(true)
+            .transparent(true)
+            .decorations(false)
+            .always_on_top(true)
+            .content_protected(true)
+            .skip_taskbar(true)
+            .visible(false)
+            .build()?;
+            tracing::info!("answer overlay pre-created (hidden)");
+
             app.global_shortcut().register(toggle_shortcut)?;
             app.global_shortcut().register(debug_shortcut)?;
             app.global_shortcut().register(quit_shortcut)?;
@@ -413,7 +435,35 @@ pub fn run() {
             commands::get_language,
             commands::simulate_interviewer,
             commands::log_from_frontend,
+            commands::open_answer_window,
         ])
+        .on_window_event(|window, event| {
+            // The answer overlay is pre-created once and reused: closing it
+            // (✕, Alt+F4) only hides it, so ⛶ can reveal it again.
+            if window.label() == "answer" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(e) = window.hide() {
+                        tracing::warn!(error = %e, "failed to hide answer window");
+                    }
+                }
+                return;
+            }
+            // The app's lifetime is the MAIN window's. Auxiliary windows must
+            // not keep the process — and the audio pipelines and global
+            // shortcuts with it — alive after it closes. destroy() (not
+            // close()) so the hide-on-close handler above can't intercept.
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                for (label, w) in window.app_handle().webview_windows() {
+                    if label != "main" {
+                        tracing::info!(%label, "destroying auxiliary window with main");
+                        if let Err(e) = w.destroy() {
+                            tracing::warn!(error = %e, %label, "failed to destroy auxiliary window");
+                        }
+                    }
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {

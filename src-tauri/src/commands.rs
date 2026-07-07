@@ -6,7 +6,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 use crate::audio;
 use crate::error::AppError;
@@ -205,6 +206,79 @@ fn streaming_engine_or_default(language: crate::lang::Language) -> audio::SttEng
         "GIMME_STT_ENGINE=streaming but this build lacks the `sherpa` feature; using default STT engine"
     );
     default_stt_engine(language)
+}
+
+/// Show and focus the pop-out answer overlay (pre-created hidden at setup —
+/// runtime `WebviewWindowBuilder::build` hangs on Windows, so the window is
+/// never built here, only revealed). Async keeps it off the main thread.
+#[allow(clippy::unused_async)]
+#[tauri::command]
+#[tracing::instrument(skip(app))]
+pub async fn open_answer_window(app: tauri::AppHandle) -> Result<(), AppError> {
+    use tauri::Manager;
+    let w = app
+        .get_webview_window("answer")
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("answer window missing (setup failed?)")))?;
+    w.show().map_err(|e| AppError::Other(anyhow::anyhow!(e)))?;
+    let _ = w.set_focus();
+    tracing::info!("answer overlay shown");
+    Ok(())
+}
+
+/// Payload for the `stt-warmup` event, so the UI can show "warming models"
+/// while heavy on-device models load in the background.
+#[derive(Clone, Serialize)]
+struct WarmupPayload {
+    state: &'static str,
+}
+
+/// Pre-load every model `start_listening` would need for `language`, off the
+/// calling thread, so the first Listen answers in milliseconds instead of
+/// paying multi-second model loads. Safe to fire repeatedly: the sherpa
+/// loaders' `OnceLock::get_or_init` serializes a concurrent Listen against
+/// the warm-up, and the whisper cells at worst build a transient duplicate
+/// that loses the `set` race.
+fn warm_stt_models(app: tauri::AppHandle, state: &AppState, language: crate::lang::Language) {
+    let whisper_cell = match language {
+        crate::lang::Language::English => Arc::clone(&state.whisper),
+        crate::lang::Language::Spanish => Arc::clone(&state.whisper_es),
+    };
+    std::thread::spawn(move || {
+        app.emit("stt-warmup", WarmupPayload { state: "started" })
+            .ok();
+        let t0 = std::time::Instant::now();
+
+        // On-device engines — with GIMME_STT_ENGINE=streaming these are what
+        // the first Listen actually waits on.
+        let stt_pref = std::env::var("GIMME_STT_ENGINE").unwrap_or_default();
+        #[cfg(feature = "sherpa")]
+        match stt_pref.as_str() {
+            "sherpa" | "parakeet" => {
+                let _ = crate::stt::parakeet(language);
+            }
+            "streaming" | "online" => {
+                let _ = crate::stt::streaming(language);
+                let _ = crate::stt::parakeet(language);
+            }
+            _ => {}
+        }
+        #[cfg(not(feature = "sherpa"))]
+        drop(stt_pref);
+
+        // Local whisper fallback for this language. English is preloaded at
+        // startup already; Spanish builds here on the first Spanish session.
+        if whisper_cell.get().is_none() {
+            match crate::transcriber::WhisperTranscriber::new(language) {
+                Ok(w) => {
+                    let _ = whisper_cell.set(Arc::new(w));
+                }
+                Err(e) => tracing::warn!(error = %e, ?language, "whisper warm-up failed"),
+            }
+        }
+
+        tracing::info!(?language, elapsed = ?t0.elapsed(), "stt warm-up done");
+        app.emit("stt-warmup", WarmupPayload { state: "done" }).ok();
+    });
 }
 
 /// Spawn one capture+transcribe pipeline on its own OS thread (`cpal::Stream` isn't
@@ -485,16 +559,26 @@ pub async fn simulate_interviewer(
 /// answer (prompt rebuilt) — see `crate::lang`.
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-#[tracing::instrument(skip(state))]
-pub fn set_language(state: tauri::State<'_, AppState>, language: String) -> Result<(), AppError> {
+#[tracing::instrument(skip(state, app))]
+pub fn set_language(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    language: String,
+) -> Result<(), AppError> {
     let new_lang = crate::lang::Language::from_tag(&language)
         .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown language: {language}")))?;
-    let mut guard = state
-        .language
-        .lock()
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    *guard = new_lang;
+    {
+        let mut guard = state
+            .language
+            .lock()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        *guard = new_lang;
+    }
     tracing::info!(?new_lang, "transcription/answer language switched");
+    // Warm this language's models in the background so the next Listen is
+    // instant. Fires on startup too — the UI pushes the persisted language
+    // as soon as it loads (initLanguage).
+    warm_stt_models(app, &state, new_lang);
     Ok(())
 }
 
@@ -522,33 +606,32 @@ async fn capture_screen_blocking() -> Result<String, AppError> {
         .map_err(|e| AppError::Vision(e.to_string()))
 }
 
-/// Capture with the overlay hidden. `contentProtected` makes DXGI duplication
-/// render our window as a BLACK RECTANGLE over everything beneath it — it
+/// Capture with the overlays hidden. `contentProtected` makes DXGI duplication
+/// render our windows as BLACK RECTANGLES over everything beneath them — they
 /// covered most of every shot (the model couldn't see the page behind it, and
 /// a large redacted region is itself a refusal magnet for gpt-4o-mini).
-/// Hide → capture → restore. Costs a ~200ms flicker of the overlay.
+/// Hide every visible app window (main + answer pop-out) → capture → restore
+/// exactly those. Costs a ~200ms flicker of the overlays.
 async fn capture_screen_hiding_overlay(app: &tauri::AppHandle) -> Result<String, AppError> {
     use tauri::Manager;
-    let window = app.get_webview_window("main");
-    let was_visible = window
-        .as_ref()
-        .is_some_and(|w| w.is_visible().unwrap_or(false));
-    if was_visible {
-        if let Some(w) = &window {
-            if let Err(e) = w.hide() {
-                tracing::warn!(error = %e, "could not hide overlay for capture");
-            } else {
-                // A beat for the compositor to actually drop the window.
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            }
+    let hidden: Vec<_> = app
+        .webview_windows()
+        .into_values()
+        .filter(|w| w.is_visible().unwrap_or(false))
+        .collect();
+    for w in &hidden {
+        if let Err(e) = w.hide() {
+            tracing::warn!(error = %e, label = w.label(), "could not hide overlay for capture");
         }
     }
+    if !hidden.is_empty() {
+        // A beat for the compositor to actually drop the windows.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
     let img = capture_screen_blocking().await;
-    if was_visible {
-        if let Some(w) = &window {
-            if let Err(e) = w.show() {
-                tracing::warn!(error = %e, "could not re-show overlay after capture");
-            }
+    for w in &hidden {
+        if let Err(e) = w.show() {
+            tracing::warn!(error = %e, label = w.label(), "could not re-show overlay after capture");
         }
     }
     img
