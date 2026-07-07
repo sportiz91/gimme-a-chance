@@ -326,6 +326,60 @@
       opacity: 0.5;
       margin-bottom: 4px;
     }
+
+    /* Shortcuts help panel — toggled with the ? toolbar button */
+    .shortcuts-panel {
+      position: fixed;
+      top: 48px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: min(480px, calc(100vw - 16px));
+      max-height: calc(100vh - 64px);
+      overflow-y: auto;
+      padding: 12px 14px;
+      background: rgba(0, 0, 0, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      display: none;
+      z-index: 1000;
+    }
+    .shortcuts-panel.visible { display: block; }
+    .shortcuts-panel .title {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      opacity: 0.5;
+      margin-bottom: 8px;
+    }
+    .shortcut-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    .shortcut-row .keys {
+      display: flex;
+      gap: 3px;
+      flex: 0 0 auto;
+      min-width: 132px;
+    }
+    kbd {
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 10px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    .shortcuts-note {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      font-size: 11px;
+      opacity: 0.6;
+    }
   </style>
   <link rel="stylesheet" href="highlight-github-dark.min.css" />
   <script src="highlight.min.js"></script>
@@ -381,6 +435,7 @@
       <label class="check-label" title="Ingest every copy as context; Ctrl+Shift+V copies the current selection and ingests it">
         <input type="checkbox" id="autoClip" checked> 📋 auto-clip
       </label>
+      <button id="shortcutsBtn" title="Keyboard shortcuts">?</button>
     </div>
 
     <div class="section-label section-head">
@@ -423,6 +478,16 @@
       </select>
       <input id="simInput" type="text" placeholder="Interviewer question to speak aloud..." />
       <button id="simBtn">🔊 Speak</button>
+    </div>
+  </div>
+
+  <div class="shortcuts-panel" id="shortcutsPanel">
+    <div class="title">Keyboard shortcuts · click or Esc to close</div>
+    <div id="shortcutsList"></div>
+    <div class="shortcuts-note">
+      Shortcuts are global — they work while another app has focus. If one
+      doesn't respond, another app holds the same binding; the toolbar
+      buttons always work.
     </div>
   </div>
 
@@ -1253,6 +1318,35 @@
       debugPanel.classList.toggle('visible');
     });
 
+    // ── Shortcuts help panel ────────────────────────────────────────────────
+    // Single source of truth for the help list — keep in sync with the
+    // shortcut definitions in lib.rs.
+    const SHORTCUTS = [
+      { keys: ['Ctrl', 'Shift', 'Space'], desc: '<b>Agent</b> — reads the whole interview so far and helps with what\'s needed right now' },
+      { keys: ['Ctrl', 'Shift', 'Enter'], desc: '<b>Add shot</b> — queue a screenshot; scroll and stack several' },
+      { keys: ['Ctrl', 'Shift', '1'], desc: '<b>Describe</b> — send queued shots in one pass, or capture+describe now if none queued' },
+      { keys: ['Ctrl', 'Shift', 'V'], desc: '<b>Clip</b> — copy the current selection and ingest it as context' },
+      { keys: ['Ctrl', 'Shift', 'H'], desc: '<b>Hide / show</b> the overlay' },
+      { keys: ['Ctrl', 'Shift', 'D'], desc: '<b>Debug</b> — toggle the metrics panel' },
+      { keys: ['Ctrl', 'Shift', 'Q'], desc: '<b>Quit</b> the app' },
+    ];
+    const shortcutsPanel = document.getElementById('shortcutsPanel');
+    document.getElementById('shortcutsList').innerHTML = SHORTCUTS.map((s) => `
+      <div class="shortcut-row">
+        <span class="keys">${s.keys.map((k) => `<kbd>${k}</kbd>`).join('')}</span>
+        <span class="desc">${s.desc}</span>
+      </div>`).join('');
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') shortcutsPanel.classList.remove('visible');
+    });
+    // Any click dismisses the open panel — it overlays the toolbar, so the
+    // ? button (whose own handler toggles) can't be reached to close it.
+    document.addEventListener('click', (e) => {
+      if (!shortcutsPanel.classList.contains('visible')) return;
+      if (e.target.closest('#shortcutsBtn')) return;
+      shortcutsPanel.classList.remove('visible');
+    });
+
     // All UI handlers live here, NOT as inline on* attributes: the packaged
     // CSP allows hashed inline <script>s but silently blocks attribute
     // handlers, so an onclick= dies with no error. addEventListener is not
@@ -1276,6 +1370,7 @@
       on('popOutBtn', 'click', () => {
         invoke('open_answer_window').catch((e) => log('error', 'open_answer_window_failed', { error: String(e) }));
       });
+      on('shortcutsBtn', 'click', () => shortcutsPanel.classList.toggle('visible'));
       on('askBtn', 'click', () => askBrain());
       on('askInput', 'keydown', (e) => { if (e.key === 'Enter') askBrain(); });
       on('simBtn', 'click', simulateInterviewer);
