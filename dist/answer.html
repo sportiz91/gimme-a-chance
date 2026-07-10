@@ -42,65 +42,28 @@
     }
     .titlebar button:hover { opacity: 1; }
 
-    /* Same markdown styling as the main window's Answer box, one size up —
-       this window exists to be read from a distance. */
+    /* The same answer stack as the main window, one size up — this window
+       exists to be read from a distance. Card styling: answer-stack.css. */
     #answer {
       flex: 1;
       overflow-y: auto;
       font-size: 16px;
-      line-height: 1.6;
-      padding: 14px 16px;
-      word-wrap: break-word;
-      user-select: text;
-      -webkit-user-select: text;
+      /* No top padding: see #response in index.html — sticky card headers. */
+      padding: 0 12px 12px;
     }
-    #answer p { margin: 0.5em 0; }
-    #answer p:first-child { margin-top: 0; }
-    #answer ul, #answer ol { margin: 0.4em 0; padding-left: 1.4em; }
-    #answer li { margin: 0.2em 0; }
-    #answer h1, #answer h2, #answer h3, #answer h4 {
-      font-size: 1.05em;
-      margin: 0.7em 0 0.3em;
-    }
-    #answer code {
-      font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', monospace;
-      font-size: 0.85em;
-      background: rgba(255, 255, 255, 0.09);
-      padding: 0.15em 0.4em;
-      border-radius: 4px;
-    }
-    #answer pre {
-      background: rgba(0, 0, 0, 0.45);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 6px;
-      padding: 10px;
-      margin: 0.6em 0;
-    }
-    #answer pre code,
-    #answer pre code.hljs {
-      display: block;
-      background: transparent;
-      padding: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
+    #answer:empty { padding-top: 10px; }
     #answer:empty::after {
       content: 'The answer streams here…';
       opacity: 0.3;
       font-style: italic;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
-    }
-    #answer.loading::after {
-      content: 'Thinking...';
-      opacity: 0.5;
-      animation: pulse 1s infinite;
-    }
   </style>
   <link rel="stylesheet" href="highlight-github-dark.min.css" />
+  <link rel="stylesheet" href="answer-stack.css" />
   <script src="highlight.min.js"></script>
+  <!-- Classic script on purpose: the inline script below calls
+       createAnswerStack() at parse time, before deferred modules run. -->
+  <script src="answer-stack.js"></script>
   <script type="module">
     import * as smd from './smd.js';
     window.smd = smd;
@@ -114,50 +77,20 @@
   <div id="answer"></div>
 
   <script>
-    // Pop-out mirror of the main window's Answer box. The main window relays
-    // its own (already trace-gated) render calls as `answer-mirror` events:
-    // reset → delta* → final | error. Same smd/hljs pipeline, no auto-scroll.
+    // Pop-out mirror of the main window's Answer stack. The main window relays
+    // every stack mutation as an `answer-mirror` event (begin/delta/final/
+    // error/clear, keyed by trace id) and we replay it into an identical stack.
+    // Collapse state is deliberately NOT mirrored — it's this reader's own view.
     const { listen, emit } = window.__TAURI__.event;
-    const box = document.getElementById('answer');
-    let parser = null;
-    let raw = '';
-
-    function renderFull(text) {
-      box.innerHTML = '';
-      parser = null;
-      if (window.smd) {
-        const p = window.smd.parser(window.smd.default_renderer(box));
-        window.smd.parser_write(p, text);
-        window.smd.parser_end(p);
-      } else {
-        box.textContent = text;
-      }
-      if (window.hljs) {
-        box.querySelectorAll('pre code').forEach(b => window.hljs.highlightElement(b));
-      }
-    }
+    const stack = window.createAnswerStack(document.getElementById('answer'));
 
     listen('answer-mirror', (event) => {
-      const { kind, text, loading } = event.payload;
-      box.classList.toggle('loading', kind === 'reset' && !!loading);
-      if (kind === 'reset') {
-        raw = '';
-        parser = null;
-        box.innerHTML = '';
-        box.scrollTop = 0;
-      } else if (kind === 'delta') {
-        raw += text;
-        if (!window.smd) { box.textContent = raw; return; }
-        if (!parser) parser = window.smd.parser(window.smd.default_renderer(box));
-        window.smd.parser_write(parser, text);
-      } else if (kind === 'final') {
-        raw = text;
-        renderFull(text);
-      } else if (kind === 'error') {
-        raw = '';
-        parser = null;
-        box.textContent = text;
-      }
+      const { op, id, text, meta } = event.payload;
+      if (op === 'begin') stack.begin(id, meta);
+      else if (op === 'delta') stack.delta(id, text);
+      else if (op === 'final') stack.final(id, text);
+      else if (op === 'error') stack.error(id, text);
+      else if (op === 'clear') stack.clear();
     });
 
     // Hide, never close: the window is pre-created once at startup and the
@@ -166,8 +99,8 @@
       window.__TAURI__.window.getCurrentWindow().hide();
     });
 
-    // Ask the main window for the current answer state (covers opening the
-    // pop-out mid-stream or after an answer already completed).
+    // Ask the main window to replay its whole stack (covers opening the pop-out
+    // mid-stream, or after several answers already piled up).
     emit('answer-window-ready', {});
   </script>
 </body>

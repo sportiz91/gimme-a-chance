@@ -1,0 +1,137 @@
+/* Answer stack — shared by the main window's Answer box (#response) and the
+   pop-out overlay (#answer). Both roots get `.answer-stack` from
+   createAnswerStack(); they differ only in font size and outer chrome. */
+
+/* Margin, not container padding: it scrolls away, so it can't leave a strip
+   above a pinned header for body text to show through. */
+.answer-stack > .answer-card { margin-top: 8px; }
+
+.answer-card {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+/* The newest answer — the one you almost always want — reads as the live one. */
+.answer-stack > .answer-card:first-child { border-color: rgba(33, 150, 243, 0.35); }
+.answer-card.error { border-color: rgba(239, 83, 80, 0.45); }
+
+/* The stack has ONE scrollbar (its container); a card body never scrolls on its
+   own — a nested scroller inside a ~190px box is unusable mid-interview. The
+   header sticks instead, so a long answer always keeps its chevron in reach:
+   you collapse it where you are, without scrolling back to its start. */
+.answer-card > summary {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  list-style: none; /* kill the native disclosure triangle; we draw our own */
+  /* Dimmed via `color`, never `opacity` — opacity would fade the background
+     too, and body text would bleed through the header while it is pinned. */
+  color: rgba(224, 224, 224, 0.72);
+  background: #1e1e20;
+  border-radius: 5px 5px 0 0;
+}
+.answer-card > summary::-webkit-details-marker { display: none; }
+.answer-card > summary:hover { color: #e8e8e8; background: #2c2c30; }
+
+/* A collapsed card is a row in a scannable index, not chrome — bigger type,
+   fatter hit target. Expanded, the same header recedes to a label again. */
+.answer-card:not([open]) > summary {
+  font-size: 12.5px;
+  padding: 7px 8px;
+  color: rgba(232, 232, 232, 0.92);
+  border-radius: 5px;
+}
+
+.answer-chev { flex: 0 0 auto; width: 12px; text-align: center; opacity: 0.7; }
+.answer-chev::before {
+  content: '▾';
+  display: inline-block;
+  transition: transform 0.12s ease;
+}
+.answer-card:not([open]) .answer-chev::before { transform: rotate(-90deg); }
+
+.answer-time {
+  flex: 0 0 auto;
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 0.9em; /* stays subordinate to the label when the card collapses */
+  opacity: 0.5;
+}
+.answer-label {
+  flex: 0 0 auto;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+/* One-line gist of a collapsed answer, so a tall stack stays scannable. */
+.answer-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+  opacity: 0.55;
+}
+.answer-card[open] .answer-preview { display: none; }
+
+.answer-body {
+  padding: 2px 10px 10px;
+  line-height: 1.6;
+  word-wrap: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.answer-body p { margin: 0.5em 0; }
+.answer-body p:first-child { margin-top: 0; }
+.answer-body ul, .answer-body ol { margin: 0.4em 0; padding-left: 1.4em; }
+.answer-body li { margin: 0.2em 0; }
+.answer-body h1, .answer-body h2, .answer-body h3, .answer-body h4 {
+  font-size: 1.05em;
+  margin: 0.7em 0 0.3em;
+}
+.answer-body code {
+  font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  background: rgba(255, 255, 255, 0.09);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+}
+.answer-body pre {
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 10px;
+  margin: 0.6em 0;
+}
+/* Long code lines WRAP instead of scrolling horizontally — panning code
+   mid-interview is unreadable; a folded line scans at a glance. */
+.answer-body pre code,
+.answer-body pre code.hljs {
+  display: block;
+  background: transparent;
+  padding: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Pending press: the placeholder rides on the NEW card, above the previous
+   answer, instead of wiping the box. */
+.answer-card.loading .answer-body::after {
+  content: 'Thinking…';
+  opacity: 0.5;
+  animation: answer-pulse 1s infinite;
+}
+@keyframes answer-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

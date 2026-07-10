@@ -342,6 +342,8 @@ fn set_provider(state: &tauri::State<'_, AppState>, provider: &str) {
     }
 }
 
+/// The Ask box: a question the user typed. The app never answers on its own —
+/// this and `ask_agent` are the only two paths to an answer, both explicit.
 #[tauri::command]
 #[tracing::instrument(skip(state, app, context), fields(trace_id = trace_id.as_deref().unwrap_or("-"), question_len = question.len(), context_len = context.len()))]
 pub async fn ask_brain(
@@ -350,23 +352,16 @@ pub async fn ask_brain(
     trace_id: Option<String>,
     question: String,
     context: String,
-    manual: Option<bool>,
 ) -> Result<String, AppError> {
     let metrics = Arc::clone(&state.metrics);
     let trace_id = trace_id.unwrap_or_else(|| "-".into());
-    // Only questions typed into the Ask box get their own `question` event;
-    // auto-answers' detected questions are already interviewer transcript
-    // lines, so they only ride along in the answer's meta below.
-    let manual = manual.unwrap_or(false);
-    if manual {
-        storage::record(storage::Event {
-            kind: "question",
-            speaker: None,
-            content: question.clone(),
-            t_s: state.agent.elapsed_s(),
-            meta: Some(serde_json::json!({ "trace_id": trace_id })),
-        });
-    }
+    storage::record(storage::Event {
+        kind: "question",
+        speaker: None,
+        content: question.clone(),
+        t_s: state.agent.elapsed_s(),
+        meta: Some(serde_json::json!({ "trace_id": trace_id })),
+    });
     let language = state
         .language
         .lock()
@@ -397,7 +392,7 @@ pub async fn ask_brain(
         t_s: state.agent.elapsed_s(),
         meta: Some(serde_json::json!({
             "trace_id": trace_id,
-            "trigger": if manual { "ask" } else { "auto" },
+            "trigger": "ask",
             "provider": outcome.provider,
             "question": question,
         })),

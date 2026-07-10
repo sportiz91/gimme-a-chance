@@ -155,6 +155,7 @@
       font-size: 11px;
       line-height: 18px;
     }
+    .head-actions { display: flex; gap: 4px; }
 
     #transcript {
       max-height: 120px;
@@ -177,62 +178,26 @@
     .partial { opacity: 0.55; font-style: italic; }
 
     /* Answer area — THE box during an interview: dominant (flex: 1 in the
-       column), larger type, and rendered markdown instead of raw text. */
+       column) and larger type. It scrolls a stack of answer cards, newest
+       first; the cards themselves are styled in answer-stack.css, shared with
+       the pop-out overlay. */
     #response {
       flex: 1;
       min-height: 80px;
       overflow-y: auto;
       font-size: var(--response-font-size);
-      line-height: 1.6;
-      padding: 10px;
+      /* No top padding: a card's sticky header pins at the scrollport's inner
+         edge, and any band above it would let body text scroll through. */
+      padding: 0 8px 8px;
       background: rgba(33, 150, 243, 0.08);
       border-radius: 6px;
       border: 1px solid rgba(33, 150, 243, 0.2);
-      word-wrap: break-word;
-      user-select: text;
-      -webkit-user-select: text;
     }
-    #response p { margin: 0.5em 0; }
-    #response p:first-child { margin-top: 0; }
-    #response ul, #response ol { margin: 0.4em 0; padding-left: 1.4em; }
-    #response li { margin: 0.2em 0; }
-    #response h1, #response h2, #response h3, #response h4 {
-      font-size: 1.05em;
-      margin: 0.7em 0 0.3em;
-    }
-    #response code {
-      font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', monospace;
-      font-size: 0.85em;
-      background: rgba(255, 255, 255, 0.09);
-      padding: 0.15em 0.4em;
-      border-radius: 4px;
-    }
-    #response pre {
-      background: rgba(0, 0, 0, 0.45);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 6px;
-      padding: 10px;
-      margin: 0.6em 0;
-    }
-    /* Long code lines WRAP instead of scrolling horizontally — panning code
-       mid-interview is unreadable; a folded line scans at a glance. */
-    #response pre code,
-    #response pre code.hljs {
-      display: block;
-      background: transparent;
-      padding: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
+    #response:empty { padding-top: 8px; }
     #response:empty::after {
       content: 'Answer will appear here...';
       opacity: 0.3;
       font-style: italic;
-    }
-    #response.loading::after {
-      content: 'Thinking...';
-      opacity: 0.5;
-      animation: pulse 1s infinite;
     }
 
     /* Vision area (screen description) */
@@ -382,7 +347,11 @@
     }
   </style>
   <link rel="stylesheet" href="highlight-github-dark.min.css" />
+  <link rel="stylesheet" href="answer-stack.css" />
   <script src="highlight.min.js"></script>
+  <!-- Classic script on purpose: the main inline script calls
+       createAnswerStack() at parse time, before deferred modules run. -->
+  <script src="answer-stack.js"></script>
   <script type="module">
     // smd.js (streaming-markdown) is an ES module; expose it for the classic
     // main script below. Module scripts run deferred, but smd is only used
@@ -413,9 +382,6 @@
         <option value="spanish">Español</option>
       </select>
       <button id="listenBtn">Listen</button>
-      <label class="check-label" title="Also answer questions YOU ask via the mic">
-        <input type="checkbox" id="answerMe"> answer me
-      </label>
     </div>
 
     <div class="controls">
@@ -458,7 +424,10 @@
 
     <div class="section-label section-head">
       <span>Answer</span>
-      <button id="popOutBtn" title="Pop the answer out into a big resizable overlay">⛶</button>
+      <span class="head-actions">
+        <button id="clearAnswersBtn" title="Clear every answer in the stack">🗑</button>
+        <button id="popOutBtn" title="Pop the answers out into a big resizable overlay">⛶</button>
+      </span>
     </div>
     <div id="response"></div>
 
@@ -503,7 +472,6 @@
     <div class="row"><span class="key">last LLM TTFT</span><span class="val" id="dbgTtft">—</span></div>
     <div class="row"><span class="key">last vision</span><span class="val" id="dbgVision">—</span></div>
     <div class="row"><span class="key">provider</span><span class="val" id="dbgProvider">—</span></div>
-    <div class="row"><span class="key">last e2e</span><span class="val" id="dbgE2e">—</span></div>
     <div class="row"><span class="key">transcript</span><span class="val" id="dbgTranscript">—</span></div>
     <div class="row"><span class="key">agent ctx</span><span class="val" id="dbgAgentCtx">—</span></div>
     <div class="row"><span class="key">agent cached</span><span class="val" id="dbgAgentCached">—</span></div>
@@ -519,9 +487,6 @@
     const { listen, emit } = window.__TAURI__.event;
 
     let isListening = false;
-    // Selected language ('english' | 'spanish'). Drives question detection below;
-    // the backend reads its own copy (set via set_language) on each Listen/answer.
-    let currentLang = 'english';
     // The rolling context store — every source the brain reads: audio lines
     // ('me'/'interviewer'), screen descriptions ('screen'), clips ('clipboard').
     // The Transcript box renders only the audio lines; screen/clipboard entries
@@ -530,13 +495,7 @@
     // Streaming engine only: per-speaker partial hypothesis, rendered as a gray
     // italic tail line that refines in place until the final replaces it.
     const partialLines = { me: '', interviewer: '' };
-    let activeTraceId = null;   // the question currently being answered (for streaming)
     let activeVisionTraceId = null; // the screen capture currently being described
-    let firstDeltaSeen = false; // whether the active answer has painted its first token
-    let lastAnsweredQ = '';     // normalized last question answered (dedup across the window)
-    let lastTraceId = null;
-    let lastTraceStart = 0;
-    let lastE2eMs = 0;
     const MAX_CONTEXT_LINES = 20;
 
     function pushContext(speaker, text) {
@@ -583,89 +542,53 @@
       ));
     }
 
-    // ── Answer box: streaming markdown ─────────────────────────────────────
-    // smd.js keeps a stateful parser per answer: each delta is fed as-is
-    // (parser_write) and unclosed constructs (a ``` fence mid-stream) render
-    // as their final form from the first token. It builds DOM via text nodes,
-    // so model output can't inject HTML. Deliberately NO auto-scroll here:
-    // in an interview you read top-down while the tail grows below.
-    // Every render call is also relayed to the pop-out overlay (answer.html)
-    // as an `answer-mirror` event; answerRaw/answerDone let a late-opened
-    // overlay catch up with the current answer.
-    let answerParser = null;
-    let answerRaw = '';
-    let answerDone = false;
+    // ── Answer box: a stack of streaming-markdown cards ────────────────────
+    // Newest answer on top, older ones collapsible below (answer-stack.js).
+    // Every mutation is also relayed to the pop-out overlay (answer.html) as an
+    // `answer-mirror` event, which drives an identical stack over there.
+    const answerStack = window.createAnswerStack(document.getElementById('response'));
 
-    function mirrorAnswer(kind, text, loading) {
-      emit('answer-mirror', { kind, text: text || '', loading: !!loading }).catch(() => {});
+    function mirror(op, id, text, meta) {
+      emit('answer-mirror', { op, id: id || '', text: text || '', meta: meta || null })
+        .catch(() => {});
     }
 
-    function resetAnswer(loading) {
-      const el = document.getElementById('response');
-      answerParser = null;
-      answerRaw = '';
-      answerDone = false;
-      el.innerHTML = '';
-      el.scrollTop = 0;
-      el.classList.toggle('loading', !!loading);
-      mirrorAnswer('reset', '', loading);
+    // `kind` is 'agent' (hotkey press) or 'ask' (typed question, carried in `label`).
+    function beginAnswer(id, meta) {
+      answerStack.begin(id, meta);
+      mirror('begin', id, '', meta);
+    }
+    function appendAnswer(id, text) {
+      // A delta for an unknown or already-settled card is stale — the stack
+      // drops it, and so does the overlay (never mirrored).
+      if (answerStack.delta(id, text)) mirror('delta', id, text);
+    }
+    function finishAnswer(id, fullText) {
+      answerStack.final(id, fullText);
+      mirror('final', id, fullText);
+    }
+    function errorAnswer(id, message) {
+      answerStack.error(id, message);
+      mirror('error', id, message);
+    }
+    function clearAnswers() {
+      answerStack.clear();
+      mirror('clear');
+      log('info', 'answers_cleared', {});
     }
 
-    function appendAnswer(text) {
-      const el = document.getElementById('response');
-      el.classList.remove('loading');
-      answerRaw += text;
-      mirrorAnswer('delta', text);
-      if (!window.smd) { el.textContent += text; return; }
-      if (!answerParser) {
-        answerParser = window.smd.parser(window.smd.default_renderer(el));
-      }
-      window.smd.parser_write(answerParser, text);
-    }
-
-    // The invoke's full answer is authoritative (deltas can be stale/dropped):
-    // re-render it whole, close the parser, then colorize code blocks once —
-    // highlighting mid-stream would fight smd's live text nodes.
-    function finishAnswer(fullText) {
-      const el = document.getElementById('response');
-      el.classList.remove('loading');
-      el.innerHTML = '';
-      answerParser = null;
-      answerRaw = fullText;
-      answerDone = true;
-      mirrorAnswer('final', fullText);
-      if (window.smd) {
-        const p = window.smd.parser(window.smd.default_renderer(el));
-        window.smd.parser_write(p, fullText);
-        window.smd.parser_end(p);
-      } else {
-        el.textContent = fullText;
-      }
-      if (window.hljs) {
-        el.querySelectorAll('pre code').forEach(b => window.hljs.highlightElement(b));
-      }
-    }
-
-    function errorAnswer(message) {
-      const el = document.getElementById('response');
-      el.classList.remove('loading');
-      el.innerHTML = '';
-      answerParser = null;
-      answerRaw = '';
-      answerDone = false;
-      el.textContent = message;
-      mirrorAnswer('error', message);
-    }
-
-    // A freshly opened pop-out announces itself; replay the current answer so
-    // it doesn't open blank mid-interview (streaming, finished, or thinking).
+    // A freshly opened pop-out announces itself; replay the whole stack so it
+    // doesn't open blank mid-interview. Oldest first — each `begin` prepends,
+    // so the overlay ends up in the same newest-on-top order. A still-streaming
+    // card is replayed as ONE delta carrying its accumulated text: that hands
+    // the overlay a parser positioned mid-stream, which subsequent deltas continue.
     listen('answer-window-ready', () => {
-      const thinking = document.getElementById('response').classList.contains('loading');
-      mirrorAnswer('reset', '', thinking);
-      if (answerDone) {
-        mirrorAnswer('final', answerRaw);
-      } else if (answerRaw) {
-        mirrorAnswer('delta', answerRaw);
+      mirror('clear');
+      for (const c of answerStack.snapshot().reverse()) {
+        mirror('begin', c.id, '', c.meta);
+        if (c.state === 'done') mirror('final', c.id, c.raw);
+        else if (c.state === 'error') mirror('error', c.id, c.raw);
+        else if (c.raw) mirror('delta', c.id, c.raw);
       }
     });
 
@@ -723,7 +646,6 @@
 
     async function setLanguage() {
       const language = document.getElementById('langSelect').value;
-      currentLang = language;
       localStorage.setItem('language', language);
       try {
         await invoke('set_language', { language });
@@ -737,7 +659,6 @@
     // the backend so both sides agree before the first Listen.
     async function initLanguage() {
       const saved = localStorage.getItem('language') || 'english';
-      currentLang = saved;
       document.getElementById('langSelect').value = saved;
       try {
         await invoke('set_language', { language: saved });
@@ -890,7 +811,6 @@
       contextLines = contextLines.filter(l => l.speaker !== 'me' && l.speaker !== 'interviewer');
       partialLines.me = '';
       partialLines.interviewer = '';
-      lastAnsweredQ = '';
       renderTranscript();
       log('info', 'transcript_cleared', {});
     }
@@ -986,70 +906,65 @@
       btn.disabled = false;
     }
 
-    async function askBrain(question, traceId) {
+    // The Ask box: a question YOU type. The only path into `ask_brain` — the
+    // app never answers on its own, every answer is an explicit press.
+    async function askBrain() {
       const input = document.getElementById('askInput');
-      const q = question || input.value.trim();
+      const q = input.value.trim();
       if (!q) return;
 
-      // If the caller didn't pass a trace_id (manual ask), mint a new one so
-      // we still get an end-to-end thread in the logs.
-      const trace_id = traceId || crypto.randomUUID();
-      activeTraceId = trace_id;
-      firstDeltaSeen = false;
+      const trace_id = crypto.randomUUID();
       const t0 = performance.now();
 
-      resetAnswer(true);
+      beginAnswer(trace_id, { kind: 'ask', label: q, ts: Date.now() });
       input.value = '';
 
-      log('info', 'ask_start', { trace_id, manual: !traceId, question_len: q.length });
+      log('info', 'ask_start', { trace_id, question_len: q.length });
 
       try {
         const SOURCE = { me: 'You', screen: 'Screen', clipboard: 'Clipboard' };
         const context = contextLines
           .map(l => (SOURCE[l.speaker] || 'Interviewer') + ': ' + l.text)
           .join('\n');
-        const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context, manual: !traceId });
-        const elapsed_ms = Math.round(performance.now() - t0);
-        finishAnswer(answer);
-        log('info', 'ask_complete', { trace_id, elapsed_ms, answer_len: answer.length });
-
-        // End-to-end: from transcription emit (backend) to painted answer (frontend).
-        if (trace_id === lastTraceId && lastTraceStart > 0) {
-          lastE2eMs = Math.round(performance.now() - lastTraceStart);
-          document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
-          log('info', 'e2e_complete', { trace_id, elapsed_ms: lastE2eMs });
-        }
+        const answer = await invoke('ask_brain', { traceId: trace_id, question: q, context });
+        finishAnswer(trace_id, answer);
+        log('info', 'ask_complete', {
+          trace_id,
+          elapsed_ms: Math.round(performance.now() - t0),
+          answer_len: answer.length,
+        });
       } catch (e) {
-        const elapsed_ms = Math.round(performance.now() - t0);
-        errorAnswer('Error: ' + e);
-        log('error', 'ask_failed', { trace_id, elapsed_ms, error: String(e) });
+        errorAnswer(trace_id, 'Error: ' + e);
+        log('error', 'ask_failed', {
+          trace_id,
+          elapsed_ms: Math.round(performance.now() - t0),
+          error: String(e),
+        });
       }
     }
 
-    // Agent press: NO question extraction — the backend sends the FULL rolling
-    // transcript + Interview State and the model infers what help is needed.
-    // Streams into the same Answer box via answer-delta.
+    // Agent press (Ctrl+Shift+Space): NO question extraction — the backend sends
+    // the FULL rolling transcript + Interview State and the model infers what
+    // help is needed. Streams into a fresh card at the top of the Answer stack.
     async function askAgent() {
       const btn = document.getElementById('agentBtn');
       if (btn.disabled) return; // hotkey re-fired while a press is in flight
       btn.disabled = true;
       btn.textContent = '🤖 Thinking…';
       const trace_id = crypto.randomUUID();
-      activeTraceId = trace_id;
-      firstDeltaSeen = false;
       const t0 = performance.now();
-      resetAnswer(true);
+      beginAnswer(trace_id, { kind: 'agent', ts: Date.now() });
       log('info', 'agent_press', { trace_id });
       try {
         const answer = await invoke('ask_agent', { traceId: trace_id });
-        finishAnswer(answer);
+        finishAnswer(trace_id, answer);
         log('info', 'agent_complete', {
           trace_id,
           elapsed_ms: Math.round(performance.now() - t0),
           answer_len: answer.length,
         });
       } catch (e) {
-        errorAnswer('Error: ' + e);
+        errorAnswer(trace_id, 'Error: ' + e);
         log('error', 'agent_failed', {
           trace_id,
           elapsed_ms: Math.round(performance.now() - t0),
@@ -1060,18 +975,13 @@
       btn.textContent = '🤖 Agent';
     }
 
-    // Stream the answer token-by-token as it arrives from the backend.
-    // The final full answer still comes back from the `ask_brain` invoke (which
-    // reconciles via finishAnswer), but these deltas paint the first line in ~1s.
+    // Stream the answer token-by-token as it arrives from the backend, routed to
+    // its own card by trace_id. The final full answer still comes back from the
+    // invoke (which reconciles via finishAnswer), but these deltas paint the
+    // first line in ~1s.
     listen('answer-delta', (event) => {
       const { trace_id, text } = event.payload;
-      if (trace_id !== activeTraceId) return; // ignore stale deltas
-      if (!firstDeltaSeen && trace_id === lastTraceId && lastTraceStart > 0) {
-        // First token = end-to-end "time to first word" for the debug panel.
-        log('info', 'ttft', { trace_id, elapsed_ms: Math.round(performance.now() - lastTraceStart) });
-      }
-      firstDeltaSeen = true;
-      appendAnswer(text);
+      appendAnswer(trace_id, text);
     });
 
     // Stream the screen description token-by-token as the vision model produces it.
@@ -1137,107 +1047,19 @@
       renderTranscript();
     });
 
+    // Transcription is CONTEXT ONLY — it must never trigger an answer. Every
+    // answer comes from an explicit press: Ctrl+Shift+Space or the Ask box.
+    // Don't reintroduce question-detection here: an answer nobody asked for
+    // burns tokens and, worse, steals the Answer box mid-interview.
     listen('transcription', (event) => {
       const { trace_id, text, speaker } = event.payload;
       const who = speaker === 'me' ? 'me' : 'interviewer';
-      lastTraceId = trace_id;
-      lastTraceStart = performance.now();
       partialLines[who] = '';
       pushContext(who, text);
       renderTranscript();
 
       log('info', 'transcription_received', { trace_id, speaker: who, text_len: text.length });
-
-      // By default only the INTERVIEWER's speech triggers an answer; your own voice
-      // is context. The "answer me" toggle lets your mic questions be answered too.
-      const answerMe = document.getElementById('answerMe').checked;
-      if (who === 'me' && !answerMe) return;
-
-      // Detect over a 2-chunk window of THIS speaker's lines so questions split
-      // across chunk boundaries are still caught. Dedup against the last answered.
-      const win = contextLines
-        .filter(l => l.speaker === who)
-        .slice(-2)
-        .map(l => l.text)
-        .join(' ');
-      const q = extractQuestion(win);
-      if (q) {
-        const norm = q.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (norm !== lastAnsweredQ) {
-          lastAnsweredQ = norm;
-          log('info', 'question_detected', { trace_id, question: q });
-          askBrain(q, trace_id);
-        }
-      }
     });
-
-    // Rhetorical / confirmatory fillers — mostly the candidate checking in, not
-    // interviewer questions worth answering. Keyed by language (see currentLang).
-    const RHETORICAL = {
-      english: [
-        'right?', 'ok?', 'okay?', 'correct?', 'got it?', 'alright?', 'all right?',
-        'yeah?', 'cool?', 'you know?', 'is that fine', 'does that make sense',
-        'make sense?', 'anything so far', 'sound good', 'sounds good',
-      ],
-      spanish: [
-        '¿no?', 'no?', '¿sí?', 'sí?', '¿ok?', 'ok?', '¿correcto?', 'correcto?',
-        '¿se entiende?', 'se entiende', '¿tiene sentido?', 'tiene sentido',
-        '¿está bien?', 'está bien', '¿dale?', 'dale?', '¿viste?', 'viste?',
-        '¿todo bien', 'hasta acá',
-      ],
-    };
-    function isRhetorical(s) {
-      const t = s.toLowerCase();
-      return (RHETORICAL[currentLang] || RHETORICAL.english).some(r => t.includes(r));
-    }
-
-    // Sentence openers that signal an interviewer question when there's no '?'.
-    const Q_STARTERS = {
-      english: [
-        'what ', 'how ', 'why ', 'can you', 'could you', 'tell me ', 'explain ',
-        'describe ', 'what\'s', 'where ', 'when ', 'which ', 'walk me through',
-        'how would', 'how do', 'what are', 'what would', 'design a', 'design the',
-        'would you ', 'do you ', 'have you ',
-      ],
-      spanish: [
-        'qué ', 'que ', 'cómo ', 'como ', 'por qué', 'por que', 'cuál', 'cual',
-        'cuándo', 'cuando', 'dónde', 'donde', 'quién', 'quien', 'podés', 'podrías',
-        'podrias', 'contame', 'contás', 'explicá', 'explicame', 'describí',
-        'describime', 'hablame de', 'háblame de', 'diseñá', 'diseña ', 'me podés',
-        'me das', 'alguna vez', 'tenés', 'tenes ', 'sabés', 'sabes ',
-      ],
-    };
-    function qStarters() {
-      return Q_STARTERS[currentLang] || Q_STARTERS.english;
-    }
-
-    // Extract a real question from a text window, or null. Handles a '?' anywhere
-    // (not just at the end) and pulls a clean lead-in so we send the LLM just the
-    // question — not the whole multi-sentence chunk.
-    function extractQuestion(text) {
-      const qi = text.lastIndexOf('?');
-      if (qi >= 0) {
-        // Lead-in: back to the previous sentence boundary, capped at 180 chars.
-        let start = Math.max(
-          text.lastIndexOf('.', qi - 1),
-          text.lastIndexOf('?', qi - 1),
-          text.lastIndexOf('!', qi - 1),
-        );
-        if (start < 0 || qi - start > 180) start = Math.max(-1, qi - 180);
-        const q = text.slice(start + 1, qi + 1).trim();
-        if (q.length >= 12 && !isRhetorical(q)) return q;
-      }
-      // No '?': accept a last sentence that starts like an interviewer question.
-      const sentences = text.split(/(?<=[.?!])\s+/).map(s => s.trim()).filter(Boolean);
-      const last = sentences[sentences.length - 1] || '';
-      // Strip leading Spanish inverted marks so '¿qué...' matches the 'qué' starter.
-      const lastNorm = last.toLowerCase().replace(/^[¿¡\s]+/, '');
-      if (last.length >= 12 && !isRhetorical(last) &&
-          qStarters().some(st => lastNorm.startsWith(st))) {
-        return last;
-      }
-      return null;
-    }
 
     // --- Debug panel wiring ---
     const debugPanel = document.getElementById('debugPanel');
@@ -1282,7 +1104,6 @@
       document.getElementById('dbgTtft').textContent = m.last_llm_ttft_ms ? m.last_llm_ttft_ms + ' ms' : '—';
       document.getElementById('dbgVision').textContent = m.last_vision_ms ? m.last_vision_ms + ' ms' : '—';
       document.getElementById('dbgProvider').textContent = m.last_provider || '—';
-      if (lastE2eMs) document.getElementById('dbgE2e').textContent = lastE2eMs + ' ms';
 
       // Agent-mode gauges: transcript growth (chars/4 ≈ tokens), last press's
       // real prompt size + prompt-cache hit rate, Interview State freshness.
@@ -1351,7 +1172,7 @@
     // CSP allows hashed inline <script>s but silently blocks attribute
     // handlers, so an onclick= dies with no error. addEventListener is not
     // CSP-gated. Functions that take optional args are wrapped so the event
-    // object never leaks into a parameter (e.g. askBrain(question, traceId)).
+    // object never leaks into a parameter (e.g. describeQueue(traceId)).
     function wireHandlers() {
       const on = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
       on('sourceSelect', 'change', loadDevices);
@@ -1367,6 +1188,7 @@
       on('clearTranscriptBtn', 'click', clearTranscript);
       on('clearVisionBtn', 'click', clearVision);
       on('clearClipboardBtn', 'click', clearClipboard);
+      on('clearAnswersBtn', 'click', clearAnswers);
       on('popOutBtn', 'click', () => {
         invoke('open_answer_window').catch((e) => log('error', 'open_answer_window_failed', { error: String(e) }));
       });
