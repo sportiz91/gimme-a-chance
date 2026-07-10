@@ -394,7 +394,7 @@
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
       </select>
-      <button id="agentBtn" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space)">🤖 Agent</button>
+      <button id="agentBtn" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space). Press again while one streams — answers stack.">🤖 Agent</button>
       <button id="addShotBtn" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
       <button id="describeBtn" title="Describe queued shots in one pass — or capture+describe now if none queued (Ctrl+Shift+1)">👁 Describe</button>
       <button id="clearQueueBtn" class="hidden" title="Discard queued shots">🗑</button>
@@ -943,18 +943,39 @@
       }
     }
 
+    // Presses are CONCURRENT: pressing again while an answer still streams opens
+    // its own card rather than being dropped. What must still be dropped is the
+    // OS key auto-repeat — Windows re-posts WM_HOTKEY while the chord is held and
+    // `global-hotkey` forwards every one as a fresh Pressed, so a held hotkey
+    // would fire a burst of billed calls. Presses this close together would also
+    // build a byte-identical prompt (same transcript, same Interview State).
+    const AGENT_REPEAT_MS = 400;
+    let lastAgentPressAt = -Infinity;
+    let agentInFlight = 0;
+
+    function paintAgentBtn() {
+      const btn = document.getElementById('agentBtn');
+      if (agentInFlight === 0) btn.textContent = '🤖 Agent';
+      else if (agentInFlight === 1) btn.textContent = '🤖 Thinking…';
+      else btn.textContent = `🤖 Thinking… (${agentInFlight})`;
+    }
+
     // Agent press (Ctrl+Shift+Space): NO question extraction — the backend sends
     // the FULL rolling transcript + Interview State and the model infers what
     // help is needed. Streams into a fresh card at the top of the Answer stack.
     async function askAgent() {
-      const btn = document.getElementById('agentBtn');
-      if (btn.disabled) return; // hotkey re-fired while a press is in flight
-      btn.disabled = true;
-      btn.textContent = '🤖 Thinking…';
-      const trace_id = crypto.randomUUID();
       const t0 = performance.now();
+      if (t0 - lastAgentPressAt < AGENT_REPEAT_MS) {
+        log('info', 'agent_press_coalesced', { since_last_ms: Math.round(t0 - lastAgentPressAt) });
+        return;
+      }
+      lastAgentPressAt = t0;
+
+      const trace_id = crypto.randomUUID();
+      agentInFlight += 1;
+      paintAgentBtn();
       beginAnswer(trace_id, { kind: 'agent', ts: Date.now() });
-      log('info', 'agent_press', { trace_id });
+      log('info', 'agent_press', { trace_id, in_flight: agentInFlight });
       try {
         const answer = await invoke('ask_agent', { traceId: trace_id });
         finishAnswer(trace_id, answer);
@@ -970,9 +991,10 @@
           elapsed_ms: Math.round(performance.now() - t0),
           error: String(e),
         });
+      } finally {
+        agentInFlight -= 1;
+        paintAgentBtn();
       }
-      btn.disabled = false;
-      btn.textContent = '🤖 Agent';
     }
 
     // Stream the answer token-by-token as it arrives from the backend, routed to
@@ -1143,7 +1165,7 @@
     // Single source of truth for the help list — keep in sync with the
     // shortcut definitions in lib.rs.
     const SHORTCUTS = [
-      { keys: ['Ctrl', 'Shift', 'Space'], desc: '<b>Agent</b> — reads the whole interview so far and helps with what\'s needed right now' },
+      { keys: ['Ctrl', 'Shift', 'Space'], desc: '<b>Agent</b> — reads the whole interview so far and helps with what\'s needed right now. Press again while one streams: the answers stack, newest first' },
       { keys: ['Ctrl', 'Shift', 'Enter'], desc: '<b>Add shot</b> — queue a screenshot; scroll and stack several' },
       { keys: ['Ctrl', 'Shift', '1'], desc: '<b>Describe</b> — send queued shots in one pass, or capture+describe now if none queued' },
       { keys: ['Ctrl', 'Shift', 'V'], desc: '<b>Clip</b> — copy the current selection and ingest it as context' },
