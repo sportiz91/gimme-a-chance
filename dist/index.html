@@ -944,13 +944,10 @@
     }
 
     // Presses are CONCURRENT: pressing again while an answer still streams opens
-    // its own card rather than being dropped. What must still be dropped is the
-    // OS key auto-repeat — Windows re-posts WM_HOTKEY while the chord is held and
-    // `global-hotkey` forwards every one as a fresh Pressed, so a held hotkey
-    // would fire a burst of billed calls. Presses this close together would also
-    // build a byte-identical prompt (same transcript, same Interview State).
-    const AGENT_REPEAT_MS = 400;
-    let lastAgentPressAt = -Infinity;
+    // its own card rather than being dropped. No debounce guards this path —
+    // `global-hotkey` registers every shortcut with MOD_NOREPEAT (see its
+    // platform_impl/windows/mod.rs), so holding the chord yields exactly one
+    // WM_HOTKEY, not a burst. Every press that arrives is one you meant.
     let agentInFlight = 0;
 
     function paintAgentBtn() {
@@ -965,12 +962,6 @@
     // help is needed. Streams into a fresh card at the top of the Answer stack.
     async function askAgent() {
       const t0 = performance.now();
-      if (t0 - lastAgentPressAt < AGENT_REPEAT_MS) {
-        log('info', 'agent_press_coalesced', { since_last_ms: Math.round(t0 - lastAgentPressAt) });
-        return;
-      }
-      lastAgentPressAt = t0;
-
       const trace_id = crypto.randomUUID();
       agentInFlight += 1;
       paintAgentBtn();
