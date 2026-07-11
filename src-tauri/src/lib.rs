@@ -25,8 +25,9 @@ mod transcriber;
 mod tts;
 mod vad;
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -146,12 +147,110 @@ impl Default for AppState {
     }
 }
 
+// Overlay hiding without the black-box bug.
+//
+// On Windows, `hide()`/`show()` degrades a window's `WDA_EXCLUDEFROMCAPTURE`
+// display affinity to `WDA_MONITOR` — a solid BLACK rectangle in any screen
+// share — and re-asserting the affinity afterward does NOT restore it (measured;
+// tauri#14189). So we never `hide()`/`show()` the overlays. "Hiding" parks a
+// window far off-screen; "showing" moves it back. Windows stay VISIBLE the whole
+// time, so the exclusion holds and the overlay is truly invisible to
+// Meet/Zoom/Teams across any number of hide/show cycles.
+
+/// Off-screen parking coordinate (well outside any monitor).
+const OFFSCREEN_XY: i32 = -32000;
+
+/// Parked-windows map: label → the on-screen position to restore it to. `None`
+/// means "no saved spot yet" (reveal centers it). Key present ⇒ window is hidden.
+type ParkedWindows = HashMap<String, Option<(i32, i32)>>;
+
+static PARKED: LazyLock<Mutex<ParkedWindows>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Labels parked by the last Ctrl+Shift+H press, restored on the next one.
+static HIDDEN_WINDOWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// True if the window is currently parked off-screen (our notion of "hidden").
+pub(crate) fn is_hidden(label: &str) -> bool {
+    PARKED
+        .lock()
+        .map(|p| p.contains_key(label))
+        .unwrap_or(false)
+}
+
+/// Park a window off-screen, remembering where it was so `reveal_onscreen` can
+/// put it back. No-op if already parked. Never touches visibility or the display
+/// affinity, so the window stays excluded from capture.
+pub(crate) fn park_offscreen(window: &tauri::WebviewWindow) {
+    let label = window.label().to_string();
+    {
+        let mut parked = PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parked.contains_key(&label) {
+            return;
+        }
+        let pos = window.outer_position().ok().map(|p| (p.x, p.y));
+        tracing::debug!(label = window.label(), saved = ?pos, "park off-screen");
+        parked.insert(label, pos);
+    }
+    if let Err(e) = window.set_position(tauri::PhysicalPosition::new(OFFSCREEN_XY, OFFSCREEN_XY)) {
+        tracing::warn!(error = %e, label = window.label(), "park off-screen failed");
+    }
+}
+
+/// Move a parked window back on-screen — to its saved spot, or centered on the
+/// first reveal. Never calls `show()`: the window was already visible, just
+/// off-screen, so its `WDA_EXCLUDEFROMCAPTURE` affinity was never disturbed.
+pub(crate) fn reveal_onscreen(window: &tauri::WebviewWindow) {
+    let label = window.label().to_string();
+    let saved = PARKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&label);
+    match saved {
+        Some(Some((x, y))) => {
+            if let Err(e) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
+                tracing::warn!(error = %e, label = window.label(), "reveal set_position failed");
+            }
+        }
+        _ => {
+            if let Err(e) = window.center() {
+                tracing::warn!(error = %e, label = window.label(), "reveal center failed");
+            }
+        }
+    }
+    // Cheap insurance — we never hide/show, so the affinity should already hold.
+    _ = window.set_content_protected(true);
+    if let Ok(pos) = window.outer_position() {
+        tracing::debug!(
+            label = window.label(),
+            x = pos.x,
+            y = pos.y,
+            "revealed on-screen"
+        );
+    }
+}
+
 // `run` is a long-by-nature Tauri builder: shortcut registration, the async
 // metrics emitter (with a sizeable counting-alloc branch), and app wiring all
 // live here.
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Disable Chromium's native window occlusion tracking BEFORE any webview is
+    // created. Our overlays get parked fully off-screen for "hidden"; with
+    // occlusion tracking on, Chromium stops compositing them and they come back
+    // BLANK when moved on-screen (a `focusable:false` window never gets the
+    // activation event that would resume it). The env var APPENDS to wry's
+    // default browser args (Chromium unions `--disable-features`), and being
+    // process-global it applies identically to every webview — sidestepping the
+    // blank/frozen-window trap of per-window arg mismatches (tauri#13092).
+    #[cfg(windows)]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--disable-features=CalculateNativeWinOcclusion",
+    );
+
     // The guards must live for the whole program lifetime, otherwise the non-blocking
     // writer thread is dropped and pending log lines may be lost on exit.
     let _telemetry_guards: &'static _ = Box::leak(Box::new(telemetry::init()));
@@ -238,20 +337,43 @@ pub fn run() {
                         return;
                     }
                     if shortcut == &toggle_shortcut {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let is_visible = window.is_visible().unwrap_or(false);
-                            tracing::debug!(
-                                was_visible = is_visible,
-                                action = if is_visible { "hide" } else { "show" },
-                                "window toggle"
-                            );
-                            let result = if is_visible {
-                                window.hide()
-                            } else {
-                                window.show().and_then(|()| window.set_focus())
+                        // Panic/toggle key. If any overlay is on-screen, park them
+                        // all off-screen (remembering which); otherwise bring back
+                        // the set the last press parked (default: just main).
+                        // Parking (never hide/show) keeps content protection intact,
+                        // so nothing is ever captured as a black box — main AND the
+                        // answer pop-out (tauri#14189).
+                        let windows = app.webview_windows();
+                        let on_screen: Vec<String> = windows
+                            .keys()
+                            .filter(|l| !is_hidden(l.as_str()))
+                            .cloned()
+                            .collect();
+                        if on_screen.is_empty() {
+                            let restore = {
+                                let mut h =
+                                    HIDDEN_WINDOWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if h.is_empty() {
+                                    vec!["main".to_string()]
+                                } else {
+                                    std::mem::take(&mut *h)
+                                }
                             };
-                            if let Err(e) = result {
-                                tracing::warn!(error = %e, "window toggle failed");
+                            tracing::debug!(?restore, "window toggle: reveal");
+                            for label in &restore {
+                                if let Some(w) = windows.get(label) {
+                                    reveal_onscreen(w);
+                                }
+                            }
+                        } else {
+                            tracing::debug!(?on_screen, "window toggle: park all");
+                            for label in &on_screen {
+                                if let Some(w) = windows.get(label) {
+                                    park_offscreen(w);
+                                }
+                            }
+                            if let Ok(mut h) = HIDDEN_WINDOWS.lock() {
+                                *h = on_screen;
                             }
                         }
                     } else if shortcut == &debug_shortcut {
@@ -280,6 +402,17 @@ pub fn run() {
                     } else if shortcut == &agent_shortcut {
                         tracing::debug!("agent-query shortcut pressed");
                         _ = app.emit("trigger-agent-query", ());
+                        // When the app is parked off-screen the press still runs —
+                        // the hidden main webview drives `ask_agent` and mirrors the
+                        // answer — but nothing is on screen to read it. Bring the
+                        // answer pop-out on-screen (built non-focusable, so it never
+                        // steals focus from the interview) carrying the streamed
+                        // answer.
+                        if is_hidden("main") {
+                            if let Some(answer) = app.get_webview_window("answer") {
+                                reveal_onscreen(&answer);
+                            }
+                        }
                     }
                 })
                 .build(),
@@ -297,15 +430,29 @@ pub fn run() {
             )
             .title("gimme — answer")
             .inner_size(720.0, 560.0)
+            // Created VISIBLE but parked off-screen — never hide()/show()n, so its
+            // WDA_EXCLUDEFROMCAPTURE affinity never degrades to a black box
+            // (tauri#14189). `reveal_onscreen` brings it in; `park_offscreen` sends
+            // it back out.
+            .position(f64::from(OFFSCREEN_XY), f64::from(OFFSCREEN_XY))
             .resizable(true)
             .transparent(true)
             .decorations(false)
             .always_on_top(true)
             .content_protected(true)
             .skip_taskbar(true)
-            .visible(false)
+            // Non-focusable (WS_EX_NOACTIVATE): appears without stealing keyboard
+            // focus from the interview app. It's read-only — mouse drag/scroll/close
+            // still work; it just never becomes the foreground window.
+            .focusable(false)
             .build()?;
-            tracing::info!("answer overlay pre-created (hidden)");
+            // Mark it parked so Ctrl+Shift+H ignores it until it's first revealed;
+            // `None` = no saved spot yet, so the first reveal centers it.
+            PARKED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("answer".to_string(), None);
+            tracing::info!("answer overlay pre-created (parked off-screen)");
 
             app.global_shortcut().register(toggle_shortcut)?;
             app.global_shortcut().register(debug_shortcut)?;
@@ -443,8 +590,10 @@ pub fn run() {
             if window.label() == "answer" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    if let Err(e) = window.hide() {
-                        tracing::warn!(error = %e, "failed to hide answer window");
+                    // Park off-screen (not hide()) so re-revealing it never shows a
+                    // black box — same reason as the toggle key (tauri#14189).
+                    if let Some(w) = window.app_handle().get_webview_window("answer") {
+                        park_offscreen(&w);
                     }
                 }
                 return;

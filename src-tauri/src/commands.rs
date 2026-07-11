@@ -219,8 +219,9 @@ pub async fn open_answer_window(app: tauri::AppHandle) -> Result<(), AppError> {
     let w = app
         .get_webview_window("answer")
         .ok_or_else(|| AppError::Other(anyhow::anyhow!("answer window missing (setup failed?)")))?;
-    w.show().map_err(|e| AppError::Other(anyhow::anyhow!(e)))?;
-    let _ = w.set_focus();
+    // Bring it on-screen (non-focusable, so no focus is stolen). It's parked
+    // off-screen rather than hidden — see `crate::reveal_onscreen`.
+    crate::reveal_onscreen(&w);
     tracing::info!("answer overlay shown");
     Ok(())
 }
@@ -601,33 +602,32 @@ async fn capture_screen_blocking() -> Result<String, AppError> {
         .map_err(|e| AppError::Vision(e.to_string()))
 }
 
-/// Capture with the overlays hidden. `contentProtected` makes DXGI duplication
-/// render our windows as BLACK RECTANGLES over everything beneath them — they
-/// covered most of every shot (the model couldn't see the page behind it, and
-/// a large redacted region is itself a refusal magnet for gpt-4o-mini).
-/// Hide every visible app window (main + answer pop-out) → capture → restore
-/// exactly those. Costs a ~200ms flicker of the overlays.
+/// Capture with the overlays out of frame. `contentProtected` makes xcap's
+/// (`BitBlt`) capture render our windows as BLACK RECTANGLES over everything
+/// beneath them — they covered most of every shot (the model couldn't see the
+/// page behind it, and a large redacted region is itself a refusal magnet for
+/// gpt-4o-mini). So park every on-screen overlay off the primary monitor →
+/// capture → move them back. Parking (not `hide()`) keeps their
+/// `WDA_EXCLUDEFROMCAPTURE` affinity intact, so a real screen share never sees a
+/// black box afterward (tauri#14189 — `hide()`/`show()` degrades it and
+/// re-asserting does not restore it). Costs a ~200ms flicker of the overlays.
 async fn capture_screen_hiding_overlay(app: &tauri::AppHandle) -> Result<String, AppError> {
     use tauri::Manager;
-    let hidden: Vec<_> = app
+    let parked: Vec<_> = app
         .webview_windows()
         .into_values()
-        .filter(|w| w.is_visible().unwrap_or(false))
+        .filter(|w| !crate::is_hidden(w.label()))
         .collect();
-    for w in &hidden {
-        if let Err(e) = w.hide() {
-            tracing::warn!(error = %e, label = w.label(), "could not hide overlay for capture");
-        }
+    for w in &parked {
+        crate::park_offscreen(w);
     }
-    if !hidden.is_empty() {
-        // A beat for the compositor to actually drop the windows.
+    if !parked.is_empty() {
+        // A beat for the compositor to settle the move off-screen.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
     let img = capture_screen_blocking().await;
-    for w in &hidden {
-        if let Err(e) = w.show() {
-            tracing::warn!(error = %e, label = w.label(), "could not re-show overlay after capture");
-        }
+    for w in &parked {
+        crate::reveal_onscreen(w);
     }
     img
 }

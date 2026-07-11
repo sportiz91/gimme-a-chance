@@ -22,7 +22,8 @@
                 "transparent": true,
                 "decorations": false,
                 "alwaysOnTop": true,
-                "contentProtected": true
+                "contentProtected": true,
+                "skipTaskbar": true
             }
         ]
     },

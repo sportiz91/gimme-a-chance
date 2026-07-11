@@ -93,10 +93,14 @@
       else if (op === 'clear') stack.clear();
     });
 
-    // Hide, never close: the window is pre-created once at startup and the
-    // ⛶ button in the main window re-shows it.
+    // Close → the backend intercepts CloseRequested and PARKS the window
+    // off-screen (never destroys it). We must NOT call hide() here: hide() sets
+    // the window invisible, and the backend re-reveal only re-positions it (it
+    // deliberately never calls show(), because show() degrades the capture
+    // exclusion to a black box — tauri#14189). So a hidden window could never be
+    // brought back. close() routes through the park path and keeps it revealable.
     document.getElementById('closeBtn').addEventListener('click', () => {
-      window.__TAURI__.window.getCurrentWindow().hide();
+      window.__TAURI__.window.getCurrentWindow().close();
     });
 
     // Ask the main window to replay its whole stack (covers opening the pop-out
