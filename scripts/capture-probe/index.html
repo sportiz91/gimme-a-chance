@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>gimme capture probe</title>
+<style>
+  html,body{margin:0;height:100%;font-family:system-ui,sans-serif}
+  body{
+    /* Loud reference background: if THIS shows through where an overlay sits,
+       the window is truly absent (invisible). If black, it renders black. */
+    background:
+      repeating-linear-gradient(45deg,#ff2d95 0 40px,#00e5ff 40px 80px,#ffe600 80px 120px,#00ff6a 120px 160px);
+    display:flex;align-items:center;justify-content:center;
+  }
+  .card{background:rgba(0,0,0,.82);color:#fff;padding:28px 34px;border-radius:14px;
+        text-align:center;max-width:560px}
+  h1{font-size:22px;margin:0 0 6px}
+  p{font-size:14px;line-height:1.5;opacity:.9}
+  button{margin-top:14px;font-size:18px;padding:12px 22px;border:0;border-radius:10px;
+         background:#4f8cff;color:#fff;cursor:pointer}
+  #status{margin-top:14px;font-size:15px;font-weight:600;min-height:22px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Capture probe — Chrome's getDisplayMedia (= Meet)</h1>
+    <p>Put the <b>gimme</b> overlays (main + pop-out) <b>over these stripes</b>,
+       then click below and choose <b>"Entire Screen"</b> in the picker.</p>
+    <p>One frame is grabbed (no live preview → no mirror) and saved instantly.</p>
+    <button id="go">📸 Capture screen</button>
+    <div id="status"></div>
+  </div>
+<script>
+const $ = document.getElementById('status');
+document.getElementById('go').addEventListener('click', async () => {
+  try {
+    $.textContent = 'Pick "Entire Screen" in the picker…';
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 }, audio: false });
+    // Off-DOM video: never rendered on screen → the grabbed frame can't contain
+    // a live preview of itself → zero recursion/mirror.
+    const video = document.createElement('video');
+    video.srcObject = stream; video.muted = true;
+    await video.play();
+    $.textContent = 'Capturing in 1.5s… hold still.';
+    await new Promise(r => setTimeout(r, 1500));
+    const c = document.createElement('canvas');
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext('2d').drawImage(video, 0, 0);
+    stream.getTracks().forEach(t => t.stop());
+    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+    const res = await fetch('/shot', { method: 'POST', body: blob });
+    $.textContent = res.ok ? `✅ Saved (${c.width}×${c.height}).` : `⚠️ Save failed: HTTP ${res.status}`;
+  } catch (e) {
+    $.textContent = '❌ ' + e.name + ': ' + e.message;
+  }
+});
+</script>
+</body>
+</html>

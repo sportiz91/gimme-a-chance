@@ -19,6 +19,9 @@ Thumbs.db
 # Telemetry / logs
 /logs/
 
+# Capture-probe output frames
+/scripts/capture-probe/shot_*.png
+
 # IDE
 .vscode/
 .idea/
