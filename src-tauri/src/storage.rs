@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 
 /// One persisted event, already final (never a streaming delta).
 pub struct Event {
@@ -52,13 +53,27 @@ struct Writer {
 
 static WRITER: OnceLock<Writer> = OnceLock::new();
 
+/// This run's session row id — the one the writer thread appends to, and the
+/// one the manager panel must never delete.
+static SESSION_ID: OnceLock<String> = OnceLock::new();
+
+/// The live session's id, once [`init`] has created its row.
+pub fn current_session_id() -> Option<&'static str> {
+    SESSION_ID.get().map(String::as_str)
+}
+
+// `title`/`description`/`context` are the free-text fields the user fills in
+// from the manager panel after the interview; everything else is machine-set.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    build      TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    ended_at   TEXT
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    build       TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT,
+    title       TEXT,
+    description TEXT,
+    context     TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY,
@@ -93,6 +108,7 @@ pub fn init() -> Result<()> {
     }
     let conn = open_db(&path)?;
     let session_id = uuid::Uuid::new_v4().to_string();
+    _ = SESSION_ID.set(session_id.clone());
     start_session(&conn, &session_id)?;
     tracing::info!(path = %path.display(), session_id = %session_id, "session persistence started");
 
@@ -157,8 +173,28 @@ fn open_db(path: &Path) -> Result<Connection> {
         anyhow::bail!("journal_mode WAL not granted (got {mode})");
     }
     conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+    // The manager panel opens its own connections next to the writer's; a
+    // short busy-wait absorbs the rare write-write overlap with an INSERT.
+    conn.pragma_update(None, "busy_timeout", 2000)?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` never
+/// upgrades an existing file, so databases created before these columns
+/// existed get them here — idempotent by checking the live column list.
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('sessions')")?;
+    let existing = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    for col in ["title", "description", "context"] {
+        if !existing.contains(col) {
+            conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} TEXT"), [])?;
+        }
+    }
+    Ok(())
 }
 
 fn start_session(conn: &Connection, id: &str) -> Result<()> {
@@ -200,6 +236,165 @@ fn end_session(conn: &Connection, id: &str) -> Result<()> {
         "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
         params![chrono::Utc::now().to_rfc3339(), id],
     )?;
+    Ok(())
+}
+
+// ── Management API — the manager panel's read/write side ───────────────────
+//
+// The panel opens its own short-lived connections (WAL was chosen exactly so
+// readers coexist with the writer thread) and never touches the `record` hot
+// path. Everything below is a pure function over a `Connection`, like the
+// writer's own helpers above.
+
+/// A connection for the manager panel. Short-lived: each command opens one,
+/// works, and drops it.
+pub fn open_management() -> Result<Connection> {
+    open_db(&db_path())
+}
+
+/// One row of the manager's session list — `sessions` plus per-session
+/// aggregates.
+#[derive(Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub context: Option<String>,
+    pub build: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub event_count: i64,
+    /// `t_s` of the session's last event — its duration, and the honest one
+    /// even when `ended_at` is missing (crash) or late (app left open).
+    pub last_t_s: i64,
+    /// This run's session: editable, but not deletable and not injectable.
+    pub live: bool,
+}
+
+/// One raw timeline event for the manager's viewer / the `.md` export.
+#[derive(Serialize)]
+pub struct EventRow {
+    pub kind: String,
+    pub speaker: Option<String>,
+    pub content: String,
+    pub t_s: i64,
+}
+
+const SUMMARY_SELECT: &str = "
+    SELECT s.id, s.name, s.title, s.description, s.context, s.build,
+           s.started_at, s.ended_at,
+           COUNT(e.id), COALESCE(MAX(e.t_s), 0)
+    FROM sessions s LEFT JOIN events e ON e.session_id = s.id";
+
+fn map_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
+    Ok(SessionSummary {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        title: r.get(2)?,
+        description: r.get(3)?,
+        context: r.get(4)?,
+        build: r.get(5)?,
+        started_at: r.get(6)?,
+        ended_at: r.get(7)?,
+        event_count: r.get(8)?,
+        last_t_s: r.get(9)?,
+        live: false,
+    })
+}
+
+/// Every recorded session, newest first.
+pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
+    let mut stmt = conn.prepare(&format!(
+        "{SUMMARY_SELECT} GROUP BY s.id ORDER BY s.started_at DESC"
+    ))?;
+    let rows = stmt.query_map([], map_summary)?;
+    let current = current_session_id();
+    let mut out = Vec::new();
+    for row in rows {
+        let mut s = row?;
+        s.live = current == Some(s.id.as_str());
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// One session's summary row, or an error naming the missing id.
+pub fn session_summary(conn: &Connection, id: &str) -> Result<SessionSummary> {
+    let mut s = conn
+        .query_row(
+            &format!("{SUMMARY_SELECT} WHERE s.id = ?1 GROUP BY s.id"),
+            [id],
+            map_summary,
+        )
+        .with_context(|| format!("session {id} not found"))?;
+    s.live = current_session_id() == Some(s.id.as_str());
+    Ok(s)
+}
+
+/// A session's full raw timeline, in insertion order.
+pub fn session_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, speaker, content, t_s FROM events WHERE session_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(EventRow {
+            kind: r.get(0)?,
+            speaker: r.get(1)?,
+            content: r.get(2)?,
+            t_s: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Save the manager panel's free-text fields. Empty fields are stored as
+/// NULL so "cleared" and "never set" read the same.
+pub fn update_session_meta(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    description: &str,
+    context: &str,
+) -> Result<()> {
+    let none_if_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let n = conn.execute(
+        "UPDATE sessions SET title = ?1, description = ?2, context = ?3 WHERE id = ?4",
+        params![
+            none_if_empty(title),
+            none_if_empty(description),
+            none_if_empty(context),
+            id
+        ],
+    )?;
+    anyhow::ensure!(n == 1, "session {id} not found");
+    Ok(())
+}
+
+/// The saved free-text context of a session (None when never filled in).
+pub fn session_context(conn: &Connection, id: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT context FROM sessions WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .with_context(|| format!("session {id} not found"))
+}
+
+/// Delete a session and its whole timeline. Refuses the live session — the
+/// writer thread is still appending to it, and deleting underneath it would
+/// leave orphaned events.
+pub fn delete_session(conn: &mut Connection, id: &str) -> Result<()> {
+    anyhow::ensure!(
+        current_session_id() != Some(id),
+        "this session is still recording — close the app before deleting it"
+    );
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM events WHERE session_id = ?1", [id])?;
+    let n = tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+    anyhow::ensure!(n == 1, "session {id} not found");
+    tx.commit()?;
     Ok(())
 }
 
@@ -273,6 +468,87 @@ mod tests {
             })
             .unwrap();
         assert!(ended.is_some());
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The management layer over a PRE-TITLE database: `migrate` adds the
+    /// free-text columns in place, meta round-trips (empty → NULL), the
+    /// timeline comes back in order, and delete clears both tables.
+    #[test]
+    fn management_round_trip() {
+        let dir = std::env::temp_dir().join(format!("gimme-mgmt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.sqlite");
+        {
+            // The first release's schema, verbatim — what real databases have.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, name TEXT NOT NULL, build TEXT NOT NULL,
+                     started_at TEXT NOT NULL, ended_at TEXT
+                 );
+                 CREATE TABLE events (
+                     id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                     kind TEXT NOT NULL, speaker TEXT, content TEXT NOT NULL,
+                     t_s INTEGER NOT NULL, created_at TEXT NOT NULL, meta TEXT
+                 );",
+            )
+            .unwrap();
+        }
+
+        let mut conn = open_db(&path).unwrap(); // migrates in place
+        start_session(&conn, "s1").unwrap();
+        insert_event(
+            &conn,
+            "s1",
+            &Event {
+                kind: "transcript",
+                speaker: Some("interviewer"),
+                content: "walk me through your resume".into(),
+                t_s: 12,
+                meta: None,
+            },
+        )
+        .unwrap();
+        insert_event(
+            &conn,
+            "s1",
+            &Event {
+                kind: "answer",
+                speaker: None,
+                content: "an answer".into(),
+                t_s: 30,
+                meta: None,
+            },
+        )
+        .unwrap();
+
+        update_session_meta(&conn, "s1", "Privalia r1", "  ", "stack: React 18").unwrap();
+        let s = session_summary(&conn, "s1").unwrap();
+        assert_eq!(s.title.as_deref(), Some("Privalia r1"));
+        assert_eq!(s.description, None); // blank saves as NULL
+        assert_eq!(s.event_count, 2);
+        assert_eq!(s.last_t_s, 30);
+        assert_eq!(
+            session_context(&conn, "s1").unwrap().as_deref(),
+            Some("stack: React 18")
+        );
+
+        let events = session_events(&conn, "s1").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "transcript");
+        assert_eq!(events[0].speaker.as_deref(), Some("interviewer"));
+
+        assert_eq!(list_sessions(&conn).unwrap().len(), 1);
+        assert!(delete_session(&mut conn, "missing").is_err());
+        delete_session(&mut conn, "s1").unwrap();
+        assert!(list_sessions(&conn).unwrap().is_empty());
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0);
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();

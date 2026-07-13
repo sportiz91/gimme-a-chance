@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>gimme — interviews</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body { height: 100%; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      background: rgba(15, 15, 15, 0.94);
+      color: #e0e0e0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .titlebar {
+      height: 32px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      background: rgba(30, 30, 30, 0.95);
+      cursor: grab;
+    }
+    .titlebar:active { cursor: grabbing; }
+    .titlebar span { font-size: 11px; opacity: 0.5; }
+    .titlebar button {
+      padding: 0 8px;
+      border: none;
+      background: transparent;
+      color: #e0e0e0;
+      font-size: 14px;
+      line-height: 24px;
+      cursor: pointer;
+      opacity: 0.6;
+    }
+    .titlebar button:hover { opacity: 1; }
+
+    .layout { flex: 1; display: flex; min-height: 0; }
+    /* Visibility is toggled via this class, never via inline style= attributes:
+       Tauri's processed CSP blocks style-src-attr (logged as a csp_violation). */
+    .hidden { display: none !important; }
+
+    /* ── Left pane: the session list ── */
+    .sessions {
+      width: 270px;
+      flex-shrink: 0;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
+      overflow-y: auto;
+      padding: 8px;
+    }
+    .session { padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; }
+    .session:hover { background: rgba(255, 255, 255, 0.05); }
+    .session.selected { background: rgba(70, 130, 220, 0.18); }
+    .session .t { font-weight: 600; display: flex; gap: 6px; align-items: center; min-width: 0; }
+    .session .t > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .session .sub { font-size: 11px; opacity: 0.55; margin-top: 2px; }
+    .badge {
+      flex-shrink: 0;
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.12);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge.live { background: rgba(80, 200, 120, 0.25); color: #7ee2a8; }
+    .badge.debug { background: rgba(255, 180, 60, 0.18); color: #f2c069; }
+
+    /* ── Right pane: editable fields + raw timeline ── */
+    .detail {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 10px 12px;
+      gap: 8px;
+    }
+    .placeholder { opacity: 0.35; font-style: italic; padding: 16px 4px; }
+    .editor { display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1; }
+
+    label.field { font-size: 11px; opacity: 0.6; display: block; margin-bottom: 2px; }
+    input[type="text"], textarea {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      color: #e0e0e0;
+      padding: 6px 8px;
+      font: inherit;
+      resize: vertical;
+    }
+    input[type="text"]:focus, textarea:focus { outline: 1px solid rgba(70, 130, 220, 0.6); }
+    textarea#description { height: 42px; }
+    textarea#context { height: 108px; }
+
+    .actions { display: flex; gap: 8px; align-items: center; min-width: 0; }
+    button {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #e0e0e0;
+      border-radius: 6px;
+      padding: 5px 10px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.15); }
+    button:disabled { opacity: 0.35; cursor: default; }
+    button.danger { border-color: rgba(255, 90, 90, 0.4); color: #ff8a8a; }
+    #status {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-left: auto;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Kind filter chips ── */
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip {
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.06);
+      cursor: pointer;
+      border: 1px solid transparent;
+      user-select: none;
+    }
+    .chip.active { background: rgba(70, 130, 220, 0.25); border-color: rgba(70, 130, 220, 0.5); }
+
+    /* ── Timeline ── */
+    #timeline {
+      flex: 1;
+      overflow-y: auto;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 6px;
+    }
+    .ev { padding: 3px 4px; display: flex; gap: 8px; }
+    .ev .ts {
+      opacity: 0.4;
+      font-size: 11px;
+      flex-shrink: 0;
+      width: 48px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      padding-top: 1px;
+    }
+    .ev .body { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+    .ev .who { font-weight: 600; margin-right: 4px; }
+    .ev.me .who { color: #7ec8ff; }
+    .ev.interviewer .who { color: #ffb86b; }
+    .ev.screen .who { color: #b18cff; }
+    .ev.clipboard .who { color: #8ee6c2; }
+    .ev.question .who { color: #f2c069; }
+    .ev.answer { background: rgba(70, 130, 220, 0.08); border-radius: 6px; }
+    .ev.answer .who { color: #8ab4f8; }
+    .ev.context .who { color: #7ee2a8; }
+
+    /* ── Delete confirmation modal (in-window HTML, not a native dialog) ── */
+    #modalBackdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+    }
+    #modalBackdrop.visible { display: flex; }
+    .modal {
+      background: #1d1d1f;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 18px;
+      width: 340px;
+    }
+    .modal h3 { font-size: 14px; margin-bottom: 8px; word-break: break-word; }
+    .modal p { font-size: 12px; opacity: 0.7; margin-bottom: 14px; }
+    .modal .actions { justify-content: flex-end; }
+  </style>
+</head>
+<body>
+  <div class="titlebar" data-tauri-drag-region>
+    <span>Interviews</span>
+    <button id="closeBtn" title="Close">✕</button>
+  </div>
+
+  <div class="layout">
+    <div class="sessions" id="sessionList"></div>
+    <div class="detail">
+      <div class="placeholder" id="placeholder">Select an interview…</div>
+      <div class="editor hidden" id="editor">
+        <div>
+          <label class="field" for="title">Title</label>
+          <input type="text" id="title" placeholder="e.g. Privalia — round 2 (code review)" />
+        </div>
+        <div>
+          <label class="field" for="description">Description</label>
+          <textarea id="description" placeholder="Company, role, round, interviewer…"></textarea>
+        </div>
+        <div>
+          <label class="field" for="context">Context — what you took away from this interview</label>
+          <textarea id="context" placeholder="Stack they use, questions asked, names, what to study for the next round…"></textarea>
+        </div>
+        <div class="actions">
+          <button id="saveBtn" title="Save title, description and context">💾 Save</button>
+          <button id="injectBtn">💉 Load into live interview</button>
+          <button id="exportBtn" title="Write a .md file under Documents\gimme-a-chance\exports and reveal it in Explorer">📄 Export .md</button>
+          <button id="deleteBtn" class="danger">🗑 Delete</button>
+          <span id="status"></span>
+        </div>
+        <div class="chips" id="chips">
+          <span class="chip active" data-f="all">All</span>
+          <span class="chip" data-f="transcript">🎤 Transcript</span>
+          <span class="chip" data-f="screen">👁 Screen</span>
+          <span class="chip" data-f="clipboard">📋 Clips</span>
+          <span class="chip" data-f="qa">💬 Q&amp;A</span>
+        </div>
+        <div id="timeline"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modalBackdrop">
+    <div class="modal">
+      <h3 id="modalTitle">Delete?</h3>
+      <p id="modalBody"></p>
+      <div class="actions">
+        <button id="cancelDeleteBtn">Cancel</button>
+        <button id="confirmDeleteBtn" class="danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // The interview manager: a read/write view over the sessions database.
+    // The RAW timeline (transcript/screen/clipboard/Q&A) is read-only by
+    // design — it's the record; title/description/context are the user's
+    // free-text fields, editable any time, on any session.
+    const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
+
+    // Same failure-forwarding as index.html: this window has no console in
+    // release, so JS errors must land in the JSONL log to be debuggable.
+    function logError(event, data) {
+      invoke('log_from_frontend', {
+        entry: { level: 'error', event, trace_id: null, elapsed_ms: null, data },
+      }).catch(() => {});
+    }
+    window.addEventListener('error', (e) => {
+      logError('manager_js_error', { error: String(e.message), source: `${e.filename || ''}:${e.lineno || 0}` });
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      logError('manager_js_unhandled_rejection', { error: String(e.reason) });
+    });
+    document.addEventListener('securitypolicyviolation', (e) => {
+      logError('manager_csp_violation', { directive: e.violatedDirective, blocked: e.blockedURI });
+    });
+
+    let sessions = [];
+    let selected = null; // the selected SessionSummary, kept in sync with `sessions`
+    let events = [];
+    let filter = 'all';
+    let statusTimer = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function status(msg, isError = false) {
+      const el = $('status');
+      el.textContent = msg;
+      el.style.color = isError ? '#ff8a8a' : '';
+      el.title = msg; // long messages (export paths, errors) survive the ellipsis
+      clearTimeout(statusTimer);
+      statusTimer = setTimeout(() => { el.textContent = ''; el.title = ''; }, isError ? 8000 : 5000);
+    }
+
+    function esc(str) {
+      return str.replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+
+    function fmtDur(s) {
+      if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+      if (s >= 60) return `${Math.round(s / 60)} min`;
+      return `${s}s`;
+    }
+
+    function fmtTs(t) {
+      const h = Math.floor(t / 3600);
+      const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
+      const ss = String(t % 60).padStart(2, '0');
+      return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+    }
+
+    // ── Session list ────────────────────────────────────────────────────────
+    async function loadSessions() {
+      try {
+        sessions = await invoke('list_sessions');
+      } catch (e) {
+        status('Load failed: ' + e, true);
+        return;
+      }
+      if (selected) {
+        const still = sessions.find((s) => s.id === selected.id);
+        if (still) {
+          selected = still;
+        } else {
+          selected = null;
+          renderDetail();
+        }
+      }
+      renderList();
+    }
+
+    function renderList() {
+      $('sessionList').innerHTML = sessions.map((s) => `
+        <div class="session ${selected && s.id === selected.id ? 'selected' : ''}" data-id="${s.id}">
+          <div class="t"><span>${esc(s.title || s.name)}</span>
+            ${s.live ? '<span class="badge live">live</span>' : ''}
+            ${s.build === 'debug' ? '<span class="badge debug">debug</span>' : ''}
+          </div>
+          <div class="sub">${esc(s.name)} · ${fmtDur(s.last_t_s)} · ${s.event_count} events</div>
+        </div>`).join('')
+        || '<div class="placeholder">No interviews recorded yet.</div>';
+    }
+
+    async function select(id) {
+      selected = sessions.find((s) => s.id === id) || null;
+      events = [];
+      renderList();
+      renderDetail();
+      if (!selected) return;
+      try {
+        events = await invoke('get_session_events', { sessionId: id });
+      } catch (e) {
+        status('Timeline load failed: ' + e, true);
+      }
+      renderTimeline();
+    }
+
+    function renderDetail() {
+      $('placeholder').classList.toggle('hidden', !!selected);
+      $('editor').classList.toggle('hidden', !selected);
+      if (!selected) return;
+      $('title').value = selected.title || '';
+      $('description').value = selected.description || '';
+      $('context').value = selected.context || '';
+      $('deleteBtn').disabled = !!selected.live;
+      $('deleteBtn').title = selected.live
+        ? 'Still recording — this run\'s own session can\'t be deleted'
+        : 'Delete this interview and its whole timeline';
+      $('injectBtn').disabled = !!selected.live;
+      $('injectBtn').title = selected.live
+        ? 'This IS the live session'
+        : 'Save, then load this context into the interview happening right now';
+      renderTimeline();
+    }
+
+    // ── Timeline ────────────────────────────────────────────────────────────
+    // One chronological stream; the chips narrow it to a source. Groups:
+    // transcript (🎤), screen (👁), clipboard (📋 both clip paths + injected
+    // context), qa (❓ questions + 🤖 answers).
+    function rowMeta(ev) {
+      if (ev.kind === 'transcript') {
+        return ev.speaker === 'me'
+          ? { group: 'transcript', cls: 'me', who: 'You' }
+          : { group: 'transcript', cls: 'interviewer', who: 'Interviewer' };
+      }
+      const KINDS = {
+        screen: { group: 'screen', cls: 'screen', who: '👁 Screen' },
+        clipboard: { group: 'clipboard', cls: 'clipboard', who: '📋 Clip' },
+        clipboard_stealth: { group: 'clipboard', cls: 'clipboard', who: '📋 Clip (stealth)' },
+        context: { group: 'clipboard', cls: 'context', who: '💉 Loaded context' },
+        question: { group: 'qa', cls: 'question', who: '❓ You asked' },
+        answer: { group: 'qa', cls: 'answer', who: '🤖 Answer' },
+      };
+      return KINDS[ev.kind] || { group: 'all', cls: '', who: ev.kind };
+    }
+
+    function renderTimeline() {
+      const rows = events
+        .map((ev) => ({ ev, meta: rowMeta(ev) }))
+        .filter((r) => filter === 'all' || r.meta.group === filter);
+      $('timeline').innerHTML = rows.map(({ ev, meta }) => `
+        <div class="ev ${meta.cls}">
+          <span class="ts">${fmtTs(ev.t_s)}</span>
+          <span class="body"><span class="who">${meta.who}:</span>${esc(ev.content)}</span>
+        </div>`).join('')
+        || `<div class="placeholder">${events.length ? 'Nothing from this source.' : 'No events recorded.'}</div>`;
+    }
+
+    // ── Actions ─────────────────────────────────────────────────────────────
+    async function save() {
+      if (!selected) return false;
+      try {
+        await invoke('update_session_meta', {
+          sessionId: selected.id,
+          title: $('title').value,
+          description: $('description').value,
+          context: $('context').value,
+        });
+        status('Saved ✓');
+        await loadSessions();
+        return true;
+      } catch (e) {
+        status('Save failed: ' + e, true);
+        return false;
+      }
+    }
+
+    // Save first: what's on screen is what gets injected/exported.
+    async function inject() {
+      if (!selected || selected.live) return;
+      if (!(await save())) return;
+      try {
+        const chars = await invoke('inject_session_context', { sessionId: selected.id });
+        status(`Context loaded into the live interview (${chars} chars) ✓`);
+      } catch (e) {
+        status('Load into interview failed: ' + e, true);
+      }
+    }
+
+    async function exportMd() {
+      if (!selected) return;
+      if (!(await save())) return;
+      try {
+        const path = await invoke('export_session_md', { sessionId: selected.id });
+        status('Exported: ' + path);
+      } catch (e) {
+        status('Export failed: ' + e, true);
+      }
+    }
+
+    function askDelete() {
+      if (!selected || selected.live) return;
+      $('modalTitle').textContent = `Delete "${selected.title || selected.name}"?`;
+      $('modalBody').textContent =
+        `${selected.event_count} events · ${fmtDur(selected.last_t_s)}. This cannot be undone.`;
+      $('modalBackdrop').classList.add('visible');
+    }
+
+    async function confirmDelete() {
+      $('modalBackdrop').classList.remove('visible');
+      if (!selected) return;
+      try {
+        await invoke('delete_session', { sessionId: selected.id });
+        selected = null;
+        renderDetail();
+        await loadSessions();
+        status('Deleted ✓');
+      } catch (e) {
+        status('Delete failed: ' + e, true);
+      }
+    }
+
+    // ── Wiring (addEventListener only — the CSP blocks on* attributes) ──────
+    $('sessionList').addEventListener('click', (e) => {
+      const row = e.target.closest('.session');
+      if (row) select(row.dataset.id);
+    });
+    $('chips').addEventListener('click', (e) => {
+      const chip = e.target.closest('.chip');
+      if (!chip) return;
+      filter = chip.dataset.f;
+      document.querySelectorAll('.chip').forEach((c) => c.classList.toggle('active', c === chip));
+      renderTimeline();
+    });
+    $('saveBtn').addEventListener('click', save);
+    $('injectBtn').addEventListener('click', inject);
+    $('exportBtn').addEventListener('click', exportMd);
+    $('deleteBtn').addEventListener('click', askDelete);
+    $('cancelDeleteBtn').addEventListener('click', () => $('modalBackdrop').classList.remove('visible'));
+    $('confirmDeleteBtn').addEventListener('click', confirmDelete);
+    $('modalBackdrop').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) e.currentTarget.classList.remove('visible');
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') $('modalBackdrop').classList.remove('visible');
+    });
+
+    // Close → the backend intercepts CloseRequested and PARKS the window
+    // off-screen (never destroys it). Same contract as the answer pop-out:
+    // never call hide() here — a hidden window could never be brought back,
+    // because the re-reveal only re-positions (tauri#14189).
+    $('closeBtn').addEventListener('click', () => {
+      window.__TAURI__.window.getCurrentWindow().close();
+    });
+
+    // The window is pre-created at app startup, so this runs once, early;
+    // every 🗂 press re-emits `manager-shown` to refresh the list (the live
+    // session keeps growing while the panel sits parked).
+    listen('manager-shown', loadSessions);
+    loadSessions();
+  </script>
+</body>
+</html>

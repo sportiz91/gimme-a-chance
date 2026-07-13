@@ -963,3 +963,177 @@ pub fn log_from_frontend(entry: FrontendLogEntry) {
         ),
     }
 }
+
+// ── Interview manager ───────────────────────────────────────────────────────
+// The panel's commands never touch the `record` hot path: each one opens its
+// own short-lived connection (`storage::open_management`) on a blocking-pool
+// thread, so neither the writer thread nor the UI thread ever waits on SQLite.
+
+/// Reveal the interview-manager overlay (pre-created at setup like the answer
+/// pop-out — runtime window builds hang on Windows) and nudge it to refresh.
+#[allow(clippy::unused_async)]
+#[tauri::command]
+#[tracing::instrument(skip(app))]
+pub async fn open_manager_window(app: tauri::AppHandle) -> Result<(), AppError> {
+    use tauri::Manager;
+    let w = app.get_webview_window("manager").ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!("manager window missing (setup failed?)"))
+    })?;
+    // Created non-focusable so its creation-time activation can't yank it
+    // on-screen (see setup); from the first reveal on it must take keyboard
+    // focus — it has text fields to type into.
+    if let Err(e) = w.set_focusable(true) {
+        tracing::warn!(error = %e, "manager set_focusable failed");
+    }
+    crate::reveal_onscreen(&w);
+    _ = app.emit_to("manager", "manager-shown", ());
+    tracing::info!("manager overlay shown");
+    Ok(())
+}
+
+/// Every recorded interview, newest first — the manager's left pane.
+#[tauri::command]
+pub async fn list_sessions() -> Result<Vec<storage::SessionSummary>, AppError> {
+    let rows = tauri::async_runtime::spawn_blocking(|| {
+        storage::list_sessions(&storage::open_management()?)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    Ok(rows)
+}
+
+/// One session's full raw timeline — the manager's viewer.
+#[tauri::command]
+#[tracing::instrument]
+pub async fn get_session_events(session_id: String) -> Result<Vec<storage::EventRow>, AppError> {
+    let rows = tauri::async_runtime::spawn_blocking(move || {
+        storage::session_events(&storage::open_management()?, &session_id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    Ok(rows)
+}
+
+/// Save the free-text fields (title / description / context) on a session.
+#[tauri::command]
+#[tracing::instrument(skip(title, description, context))]
+pub async fn update_session_meta(
+    session_id: String,
+    title: String,
+    description: String,
+    context: String,
+) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        storage::update_session_meta(
+            &storage::open_management()?,
+            &session_id,
+            &title,
+            &description,
+            &context,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    Ok(())
+}
+
+/// Delete a session and its whole timeline. The frontend confirms first; the
+/// storage layer refuses the live session.
+#[tauri::command]
+#[tracing::instrument]
+pub async fn delete_session(session_id: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        storage::delete_session(&mut storage::open_management()?, &session_id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    Ok(())
+}
+
+/// A session's display name, reduced to something a Windows filename accepts.
+fn filename_slug(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let slug = cleaned
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    if slug.is_empty() {
+        "session".into()
+    } else {
+        slug
+    }
+}
+
+/// Export a session to Markdown under `Documents\gimme-a-chance\exports\` and
+/// reveal the file in Explorer. Deterministic filename (date + title slug), so
+/// re-exporting after editing the fields updates the same file. Returns the
+/// written path.
+#[tauri::command]
+#[tracing::instrument]
+pub async fn export_session_md(session_id: String) -> Result<String, AppError> {
+    use anyhow::Context;
+    let path =
+        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<std::path::PathBuf> {
+            let conn = storage::open_management()?;
+            let summary = storage::session_summary(&conn, &session_id)?;
+            let events = storage::session_events(&conn, &session_id)?;
+            let md = crate::export::session_markdown(&summary, &events);
+
+            let dir = dirs_next::document_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("gimme-a-chance")
+                .join("exports");
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            let title = summary.title.as_deref().unwrap_or(&summary.name);
+            let date = summary.started_at.get(..10).unwrap_or("session");
+            let file = dir.join(format!("{date}-{}.md", filename_slug(title)));
+            std::fs::write(&file, md).with_context(|| format!("write {}", file.display()))?;
+
+            // Best-effort reveal; the returned path is the real deliverable.
+            _ = std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", file.display()))
+                .spawn();
+            Ok(file)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("export task join: {e}"))??;
+    tracing::info!(path = %path.display(), "session exported");
+    Ok(path.display().to_string())
+}
+
+/// Load a past session's saved context into the LIVE interview. Three sinks,
+/// same as any ingested clip: the agent's transcript (`ask_agent`), the main
+/// window's rolling context store via `clipboard-text` (`ask_brain` + the
+/// Clipboard box), and the current session's log as a `context` event — so
+/// the round-2 recording shows what the model had been pre-briefed with.
+#[tauri::command]
+#[tracing::instrument(skip(app))]
+pub async fn inject_session_context(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<usize, AppError> {
+    let text = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<String> {
+        let context = storage::session_context(&storage::open_management()?, &session_id)?;
+        context
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("this session has no saved context"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    crate::agent::push_line_tagged(&app, "clipboard", "context", &text);
+    _ = app.emit_to(
+        "main",
+        "clipboard-text",
+        serde_json::json!({ "text": text }),
+    );
+    tracing::info!(
+        chars = text.len(),
+        "saved context injected into live session"
+    );
+    Ok(text.len())
+}

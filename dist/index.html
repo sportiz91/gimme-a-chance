@@ -401,6 +401,7 @@
       <label class="check-label" title="Ingest every copy as context; Ctrl+Shift+V copies the current selection and ingests it">
         <input type="checkbox" id="autoClip" checked> 📋 auto-clip
       </label>
+      <button id="managerBtn" title="Interviews — browse, annotate, export or delete recorded sessions">🗂</button>
       <button id="shortcutsBtn" title="Keyboard shortcuts">?</button>
     </div>
 
@@ -1204,6 +1205,9 @@
       on('clearAnswersBtn', 'click', clearAnswers);
       on('popOutBtn', 'click', () => {
         invoke('open_answer_window').catch((e) => log('error', 'open_answer_window_failed', { error: String(e) }));
+      });
+      on('managerBtn', 'click', () => {
+        invoke('open_manager_window').catch((e) => log('error', 'open_manager_window_failed', { error: String(e) }));
       });
       on('shortcutsBtn', 'click', () => shortcutsPanel.classList.toggle('visible'));
       on('askBtn', 'click', () => askBrain());

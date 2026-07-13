@@ -13,6 +13,7 @@ mod crashlog;
 #[cfg(feature = "sherpa")]
 mod dtln;
 mod error;
+mod export;
 mod lang;
 mod latency;
 mod metrics;
@@ -157,8 +158,19 @@ impl Default for AppState {
 // time, so the exclusion holds and the overlay is truly invisible to
 // Meet/Zoom/Teams across any number of hide/show cycles.
 
-/// Off-screen parking coordinate (well outside any monitor).
+/// Off-screen parking coordinate (well outside any monitor). PHYSICAL pixels —
+/// used with `PhysicalPosition` in [`park_offscreen`], where it lands exactly
+/// at -32000, safely inside the signed-16-bit range USER32 still clamps to.
 const OFFSCREEN_XY: i32 = -32000;
+
+/// Placeholder position for CREATING the aux overlays. Builder positions are
+/// LOGICAL (scaled by monitor DPI) and the shell "fixes up" a visible window
+/// created fully off-screen back onto the screen — at 125% scaling both aux
+/// overlays popped up at launch. The value here barely matters: right after
+/// `build()` each overlay is re-parked with a PHYSICAL `set_position` to
+/// [`OFFSCREEN_XY`], which Windows provably respects (it's the same call the
+/// Ctrl+Shift+H toggle makes).
+const OFFSCREEN_CREATE_XY: i32 = -12000;
 
 /// Parked-windows map: label → the on-screen position to restore it to. `None`
 /// means "no saved spot yet" (reveal centers it). Key present ⇒ window is hidden.
@@ -423,7 +435,7 @@ pub fn run() {
             // the webview half-initialized: white window, build() never
             // returned) — setup-time creation is the reliable path, and it
             // makes the ⛶ button instant (show/hide from then on).
-            tauri::WebviewWindowBuilder::new(
+            let answer = tauri::WebviewWindowBuilder::new(
                 app,
                 "answer",
                 tauri::WebviewUrl::App("answer.html".into()),
@@ -434,7 +446,7 @@ pub fn run() {
             // WDA_EXCLUDEFROMCAPTURE affinity never degrades to a black box
             // (tauri#14189). `reveal_onscreen` brings it in; `park_offscreen` sends
             // it back out.
-            .position(f64::from(OFFSCREEN_XY), f64::from(OFFSCREEN_XY))
+            .position(f64::from(OFFSCREEN_CREATE_XY), f64::from(OFFSCREEN_CREATE_XY))
             .resizable(true)
             .transparent(true)
             .decorations(false)
@@ -452,7 +464,50 @@ pub fn run() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert("answer".to_string(), None);
+            // Re-park at the PHYSICAL magic coordinate. The builder position is
+            // logical and the shell "fixes up" a visible window created at any
+            // other fully-off-screen spot back onto the screen; -32000 physical
+            // (the OS's own minimized-window parking value, the same SetWindowPos
+            // the Ctrl+Shift+H toggle uses) is provably respected.
+            if let Err(e) =
+                answer.set_position(tauri::PhysicalPosition::new(OFFSCREEN_XY, OFFSCREEN_XY))
+            {
+                tracing::warn!(error = %e, "answer creation park failed");
+            }
             tracing::info!("answer overlay pre-created (parked off-screen)");
+
+            // The interview manager panel — same recipe (pre-created, parked,
+            // capture-protected). Created NON-focusable like the answer overlay
+            // even though it has text fields, so its creation never activates
+            // it or steals focus at app start; the 🗂 open command flips it
+            // focusable right before revealing it (typing needs focus).
+            let manager = tauri::WebviewWindowBuilder::new(
+                app,
+                "manager",
+                tauri::WebviewUrl::App("manager.html".into()),
+            )
+            .title("gimme — interviews")
+            .inner_size(920.0, 640.0)
+            .position(f64::from(OFFSCREEN_CREATE_XY), f64::from(OFFSCREEN_CREATE_XY))
+            .resizable(true)
+            .transparent(true)
+            .decorations(false)
+            .always_on_top(true)
+            .content_protected(true)
+            .skip_taskbar(true)
+            .focusable(false)
+            .build()?;
+            PARKED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("manager".to_string(), None);
+            // Same PHYSICAL re-park as the answer overlay above.
+            if let Err(e) =
+                manager.set_position(tauri::PhysicalPosition::new(OFFSCREEN_XY, OFFSCREEN_XY))
+            {
+                tracing::warn!(error = %e, "manager creation park failed");
+            }
+            tracing::info!("manager overlay pre-created (parked off-screen)");
 
             app.global_shortcut().register(toggle_shortcut)?;
             app.global_shortcut().register(debug_shortcut)?;
@@ -583,16 +638,33 @@ pub fn run() {
             commands::simulate_interviewer,
             commands::log_from_frontend,
             commands::open_answer_window,
+            commands::open_manager_window,
+            commands::list_sessions,
+            commands::get_session_events,
+            commands::update_session_meta,
+            commands::delete_session,
+            commands::export_session_md,
+            commands::inject_session_context,
         ])
         .on_window_event(|window, event| {
-            // The answer overlay is pre-created once and reused: closing it
-            // (✕, Alt+F4) only hides it, so ⛶ can reveal it again.
-            if window.label() == "answer" {
+            // The auxiliary overlays (answer pop-out, interview manager) are
+            // pre-created once and reused: closing one (✕, Alt+F4) only hides
+            // it, so its open button can reveal it again.
+            let label = window.label();
+            if label == "answer" || label == "manager" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     // Park off-screen (not hide()) so re-revealing it never shows a
                     // black box — same reason as the toggle key (tauri#14189).
-                    if let Some(w) = window.app_handle().get_webview_window("answer") {
+                    // Trust the ✕ press over the bookkeeping: if a shell quirk put
+                    // the window on-screen while PARKED still listed it, the park
+                    // would no-op and the ✕ would do nothing — purge the stale
+                    // entry first so the window is parked unconditionally.
+                    if let Some(w) = window.app_handle().get_webview_window(label) {
+                        PARKED
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(label);
                         park_offscreen(&w);
                     }
                 }
