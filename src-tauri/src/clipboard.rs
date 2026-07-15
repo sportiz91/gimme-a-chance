@@ -24,9 +24,11 @@ use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use tauri::{AppHandle, Emitter};
 
-/// Ingest cap. Interview-sized code and statements are a few KB; a stray
-/// "copy a whole log file" must not flood the answer context.
-const MAX_CLIP_CHARS: usize = 16_000;
+/// Ingest cap. Sized for whole prep documents (~25k tokens), not just
+/// interview-sized code snippets: the answering models run with ~1M-token
+/// context, so the ceiling only exists so a stray "copy a whole log file"
+/// can't flood the answer context.
+const MAX_CLIP_CHARS: usize = 100_000;
 
 /// Payload of the `clipboard-text` event (the auto-clip path).
 #[derive(Clone, serde::Serialize)]
