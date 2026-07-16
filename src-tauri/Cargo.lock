@@ -1679,6 +1679,7 @@ dependencies = [
  "uuid",
  "webrtc-vad",
  "whisper-rs",
+ "windows-sys 0.59.0",
  "xcap",
 ]
 

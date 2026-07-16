@@ -93,6 +93,11 @@ webrtc-vad = "0.4"
 dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+# WM_CANCELMODE to end the OS modal move loop when parking a dragged window
+# (already in the tree via tauri/tao — this only unions the features).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [features]
 flame = ["dep:tracing-flame"]
 tracy = ["dep:tracing-tracy"]

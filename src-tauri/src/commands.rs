@@ -611,15 +611,20 @@ async fn capture_screen_blocking() -> Result<String, AppError> {
 /// `WDA_EXCLUDEFROMCAPTURE` affinity intact, so a real screen share never sees a
 /// black box afterward (tauri#14189 — `hide()`/`show()` degrades it and
 /// re-asserting does not restore it). Costs a ~200ms flicker of the overlays.
+///
+/// The park is `Transient` and the restore is conditional: if Ctrl+Shift+H (or
+/// a ✕) fires mid-bracket it re-parks the windows under its own reason, and
+/// this restore leaves them hidden — the panic key must never lose to a
+/// capture racing it.
 async fn capture_screen_hiding_overlay(app: &tauri::AppHandle) -> Result<String, AppError> {
     use tauri::Manager;
     let parked: Vec<_> = app
         .webview_windows()
         .into_values()
-        .filter(|w| !crate::is_hidden(w.label()))
+        .filter(crate::is_onscreen)
         .collect();
     for w in &parked {
-        crate::park_offscreen(w);
+        crate::park_offscreen(w, crate::ParkReason::Transient);
     }
     if !parked.is_empty() {
         // A beat for the compositor to settle the move off-screen.
@@ -627,7 +632,7 @@ async fn capture_screen_hiding_overlay(app: &tauri::AppHandle) -> Result<String,
     }
     let img = capture_screen_blocking().await;
     for w in &parked {
-        crate::reveal_onscreen(w);
+        crate::reveal_if_transient(w);
     }
     img
 }
@@ -1002,6 +1007,20 @@ pub async fn open_manager_window(app: tauri::AppHandle) -> Result<(), AppError> 
 /// `begin_resize` / `resize_tick` / `end_resize`, which resize the window with
 /// plain window moves. No OS sizing loop, no cursor change, ever.
 static RESIZE_DRAG: std::sync::Mutex<Option<ResizeDrag>> = std::sync::Mutex::new(None);
+
+/// Kill the live resize drag if it targets `label`. Called by
+/// `crate::park_offscreen`: each tick recomputes the window rect from the
+/// drag-start (on-screen) snapshot, so a tick landing after a park would
+/// resurrect the parked window on-screen behind the bookkeeping's back.
+pub(crate) fn abort_resize(label: &str) {
+    let mut drag = RESIZE_DRAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if drag.as_ref().is_some_and(|d| d.label == label) {
+        tracing::debug!(%label, "resize drag aborted by park");
+        *drag = None;
+    }
+}
 
 struct ResizeDrag {
     label: String,

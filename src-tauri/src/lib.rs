@@ -157,6 +157,15 @@ impl Default for AppState {
 // window far off-screen; "showing" moves it back. Windows stay VISIBLE the whole
 // time, so the exclusion holds and the overlay is truly invisible to
 // Meet/Zoom/Teams across any number of hide/show cycles.
+//
+// GEOMETRY is the truth for "is it hidden?". Two shipped features can move a
+// window behind the bookkeeping's back — the shell's DPI fix-up of off-screen
+// windows (see `OFFSCREEN_CREATE_XY`), and a manual-resize tick landing after
+// a park (`resize_tick` recomputes the rect from its drag-start snapshot) — so
+// map membership alone goes stale: a window visibly on-screen that the toggle
+// would then skip, exactly the "Ctrl+Shift+H hid main but not the answer"
+// failure. Every decision point asks the window where it actually IS
+// (`is_onscreen`); `PARKED` only remembers where to put it back and WHY.
 
 /// Off-screen parking coordinate (well outside any monitor). PHYSICAL pixels —
 /// used with `PhysicalPosition` in [`park_offscreen`], where it lands exactly
@@ -172,55 +181,169 @@ const OFFSCREEN_XY: i32 = -32000;
 /// Ctrl+Shift+H toggle makes).
 const OFFSCREEN_CREATE_XY: i32 = -12000;
 
-/// Parked-windows map: label → the on-screen position to restore it to. `None`
-/// means "no saved spot yet" (reveal centers it). Key present ⇒ window is hidden.
-type ParkedWindows = HashMap<String, Option<(i32, i32)>>;
+/// A window whose x is at or left of this is parked, not merely on a left-hand
+/// monitor: real multi-monitor desktops top out around -16k (USER32 clamps
+/// window coordinates to signed 16 bits), and the only writers of anything
+/// smaller are [`park_offscreen`] and the creation re-park, both of which use
+/// [`OFFSCREEN_XY`].
+const OFFSCREEN_MAX_X: i32 = -20_000;
 
-static PARKED: LazyLock<Mutex<ParkedWindows>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Labels parked by the last Ctrl+Shift+H press, restored on the next one.
-static HIDDEN_WINDOWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// True if the window is currently parked off-screen (our notion of "hidden").
-pub(crate) fn is_hidden(label: &str) -> bool {
-    PARKED
-        .lock()
-        .map(|p| p.contains_key(label))
-        .unwrap_or(false)
+/// Why a window was parked — decides who is allowed to bring it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParkReason {
+    /// Ctrl+Shift+H parked it; the next Ctrl+Shift+H press restores it.
+    ToggleHidden,
+    /// The user dismissed it (✕, Alt+F4) or it was pre-created and never
+    /// opened; only its own open button reveals it, never the toggle.
+    Dismissed,
+    /// A screen capture parked it for the shot and restores it right after —
+    /// unless the toggle or a ✕ re-parks it with their own reason meanwhile,
+    /// in which case that intent wins and the capture leaves it hidden.
+    Transient,
 }
 
-/// Park a window off-screen, remembering where it was so `reveal_onscreen` can
-/// put it back. No-op if already parked. Never touches visibility or the display
-/// affinity, so the window stays excluded from capture.
-pub(crate) fn park_offscreen(window: &tauri::WebviewWindow) {
+/// A parked window: the on-screen spot to restore it to (`None` = never had
+/// one; reveal centers it) and why it was parked. Membership in [`PARKED`] is
+/// NOT trusted as "the window is off-screen" — see the module comment; ask
+/// [`is_onscreen`] for that.
+struct Parked {
+    saved: Option<(i32, i32)>,
+    reason: ParkReason,
+}
+
+static PARKED: LazyLock<Mutex<HashMap<String, Parked>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Where the window actually is, per the OS — the ground truth every
+/// hide/show decision is based on. On a position read error, assume on-screen:
+/// the toggle will then park it (worst case a redundant move) rather than
+/// skip a window the user can see.
+pub(crate) fn is_onscreen(window: &tauri::WebviewWindow) -> bool {
+    window
+        .outer_position()
+        .map(|p| p.x > OFFSCREEN_MAX_X)
+        .unwrap_or(true)
+}
+
+/// End a native modal move loop (titlebar drag) on `window`, if one is live.
+/// Measured: while the OS move loop runs it repositions the window at the
+/// cursor on every tick, overriding a park until the mouse button is released
+/// — the drag sibling of `commands::abort_resize`.
+#[cfg(windows)]
+#[allow(unsafe_code)] // one Win32 message send, no pointer payload
+fn cancel_native_drag(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CANCELMODE};
+    if let Ok(hwnd) = window.hwnd() {
+        // SAFETY: hwnd is a live handle owned by this process; WM_CANCELMODE
+        // carries nothing in wparam/lparam.
+        unsafe {
+            SendMessageW(hwnd.0.cast(), WM_CANCELMODE, 0, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cancel_native_drag(_window: &tauri::WebviewWindow) {}
+
+/// Park a window off-screen, remembering where it was and why, so the right
+/// party can put it back. Never touches visibility or the display affinity, so
+/// the window stays excluded from capture (tauri#14189).
+///
+/// Trusts geometry over the map: a window that is actually on-screen — even
+/// one `PARKED` already lists (shell fix-up, resize resurrection) — gets its
+/// current position saved and is parked again. One that is genuinely
+/// off-screen is left where it is and only the reason is updated: the latest
+/// intent wins (Ctrl+Shift+H flips a capture's `Transient` so the capture
+/// won't reveal it behind the user's back; ✕ makes it `Dismissed`).
+pub(crate) fn park_offscreen(window: &tauri::WebviewWindow, reason: ParkReason) {
     let label = window.label().to_string();
+    // A live manual edge-resize drag would resurrect the window from its
+    // drag-start (on-screen) snapshot on the next tick, and a native titlebar
+    // drag keeps repositioning it at the cursor (measured live) — kill both
+    // first so the park sticks.
+    commands::abort_resize(&label);
+    cancel_native_drag(window);
     {
         let mut parked = PARKED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if parked.contains_key(&label) {
+        if is_onscreen(window) {
+            let pos = window.outer_position().ok().map(|p| (p.x, p.y));
+            tracing::debug!(label = %label, saved = ?pos, ?reason, "park off-screen");
+            parked.insert(label, Parked { saved: pos, reason });
+        } else if let Some(entry) = parked.get_mut(&label) {
+            // Already off-screen with bookkeeping: keep the saved spot, adopt
+            // the new intent. No move needed.
+            if entry.reason != reason {
+                tracing::debug!(label = %label, from = ?entry.reason, to = ?reason, "park: reason updated");
+                entry.reason = reason;
+            }
             return;
+        } else {
+            // Off-screen with no bookkeeping (a failed reveal's leftovers):
+            // adopt it with no saved spot, so a reveal centers it.
+            tracing::debug!(label = %label, ?reason, "park: adopted off-screen orphan");
+            parked.insert(
+                label,
+                Parked {
+                    saved: None,
+                    reason,
+                },
+            );
         }
-        let pos = window.outer_position().ok().map(|p| (p.x, p.y));
-        tracing::debug!(label = window.label(), saved = ?pos, "park off-screen");
-        parked.insert(label, pos);
     }
     if let Err(e) = window.set_position(tauri::PhysicalPosition::new(OFFSCREEN_XY, OFFSCREEN_XY)) {
         tracing::warn!(error = %e, label = window.label(), "park off-screen failed");
     }
 }
 
-/// Move a parked window back on-screen — to its saved spot, or centered on the
-/// first reveal. Never calls `show()`: the window was already visible, just
-/// off-screen, so its `WDA_EXCLUDEFROMCAPTURE` affinity was never disturbed.
+/// Move a parked window back on-screen — to its saved spot, or centered when
+/// no spot was ever saved. Never calls `show()`: the window was already
+/// visible, just off-screen, so its `WDA_EXCLUDEFROMCAPTURE` affinity was
+/// never disturbed.
 pub(crate) fn reveal_onscreen(window: &tauri::WebviewWindow) {
+    reveal(window, None);
+}
+
+/// Reveal only if the window is still parked as [`ParkReason::Transient`] —
+/// the capture bracket's restore path. If Ctrl+Shift+H or a ✕ claimed the
+/// window mid-capture (its reason changed), that intent wins: the capture
+/// must never un-hide an overlay the user just hid.
+pub(crate) fn reveal_if_transient(window: &tauri::WebviewWindow) {
+    reveal(window, Some(ParkReason::Transient));
+}
+
+fn reveal(window: &tauri::WebviewWindow, only_if: Option<ParkReason>) {
     let label = window.label().to_string();
-    let saved = PARKED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&label);
-    match saved {
-        Some(Some((x, y))) => {
+    // Decide and un-bookkeep under one lock, so a park with a different
+    // reason can't slip between the check and the removal.
+    let entry = {
+        let mut parked = PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match parked.get(&label) {
+            Some(p) if only_if.is_none_or(|r| p.reason == r) => parked.remove(&label),
+            Some(p) => {
+                tracing::debug!(label = %label, reason = ?p.reason, "reveal skipped: claimed by another intent");
+                return;
+            }
+            // Not in the map. On-screen: nothing to reveal. Off-screen: an
+            // orphan whose bookkeeping was lost — recover it by centering
+            // (but never on the conditional path: the capture only restores
+            // what it parked itself).
+            None => {
+                if only_if.is_some() || is_onscreen(window) {
+                    return;
+                }
+                None
+            }
+        }
+    };
+    match entry {
+        Some(Parked {
+            saved: Some((x, y)),
+            ..
+        }) => {
             if let Err(e) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
                 tracing::warn!(error = %e, label = window.label(), "reveal set_position failed");
             }
@@ -349,28 +472,42 @@ pub fn run() {
                         return;
                     }
                     if shortcut == &toggle_shortcut {
-                        // Panic/toggle key. If any overlay is on-screen, park them
-                        // all off-screen (remembering which); otherwise bring back
-                        // the set the last press parked (default: just main).
-                        // Parking (never hide/show) keeps content protection intact,
-                        // so nothing is ever captured as a black box — main AND the
-                        // answer pop-out (tauri#14189).
+                        // Panic/toggle key. HIDE if anything is effectively
+                        // visible: actually on-screen (geometry, not the map —
+                        // see the parking module comment) or parked transiently
+                        // by a capture that is about to put it back. Otherwise
+                        // SHOW: restore every window this key parked (default:
+                        // just main), however many presses and intervening
+                        // reveals it took to park them. Parking (never
+                        // hide/show) keeps content protection intact, so
+                        // nothing is ever captured as a black box (tauri#14189).
                         let windows = app.webview_windows();
-                        let on_screen: Vec<String> = windows
-                            .keys()
-                            .filter(|l| !is_hidden(l.as_str()))
-                            .cloned()
-                            .collect();
-                        if on_screen.is_empty() {
-                            let restore = {
-                                let mut h =
-                                    HIDDEN_WINDOWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if h.is_empty() {
-                                    vec!["main".to_string()]
-                                } else {
-                                    std::mem::take(&mut *h)
+                        let to_hide: Vec<String> = {
+                            let parked = PARKED
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut v = Vec::new();
+                            for (label, w) in &windows {
+                                let transient = parked
+                                    .get(label)
+                                    .is_some_and(|p| p.reason == ParkReason::Transient);
+                                if transient || is_onscreen(w) {
+                                    v.push(label.clone());
                                 }
-                            };
+                            }
+                            v
+                        };
+                        if to_hide.is_empty() {
+                            let mut restore: Vec<String> = PARKED
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .iter()
+                                .filter(|(_, p)| p.reason == ParkReason::ToggleHidden)
+                                .map(|(label, _)| label.clone())
+                                .collect();
+                            if restore.is_empty() {
+                                restore.push("main".to_string());
+                            }
                             tracing::debug!(?restore, "window toggle: reveal");
                             for label in &restore {
                                 if let Some(w) = windows.get(label) {
@@ -378,14 +515,11 @@ pub fn run() {
                                 }
                             }
                         } else {
-                            tracing::debug!(?on_screen, "window toggle: park all");
-                            for label in &on_screen {
+                            tracing::debug!(?to_hide, "window toggle: park all");
+                            for label in &to_hide {
                                 if let Some(w) = windows.get(label) {
-                                    park_offscreen(w);
+                                    park_offscreen(w, ParkReason::ToggleHidden);
                                 }
-                            }
-                            if let Ok(mut h) = HIDDEN_WINDOWS.lock() {
-                                *h = on_screen;
                             }
                         }
                     } else if shortcut == &debug_shortcut {
@@ -420,7 +554,10 @@ pub fn run() {
                         // answer pop-out on-screen (built non-focusable, so it never
                         // steals focus from the interview) carrying the streamed
                         // answer.
-                        if is_hidden("main") {
+                        let main_hidden = app
+                            .get_webview_window("main")
+                            .is_some_and(|w| !is_onscreen(&w));
+                        if main_hidden {
                             if let Some(answer) = app.get_webview_window("answer") {
                                 reveal_onscreen(&answer);
                             }
@@ -463,12 +600,18 @@ pub fn run() {
             // still work; it just never becomes the foreground window.
             .focusable(false)
             .build()?;
-            // Mark it parked so Ctrl+Shift+H ignores it until it's first revealed;
-            // `None` = no saved spot yet, so the first reveal centers it.
+            // Mark it parked-as-dismissed so Ctrl+Shift+H ignores it until it's
+            // first revealed; no saved spot yet, so the first reveal centers it.
             PARKED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert("answer".to_string(), None);
+                .insert(
+                    "answer".to_string(),
+                    Parked {
+                        saved: None,
+                        reason: ParkReason::Dismissed,
+                    },
+                );
             // Re-park at the PHYSICAL magic coordinate. The builder position is
             // logical and the shell "fixes up" a visible window created at any
             // other fully-off-screen spot back onto the screen; -32000 physical
@@ -506,7 +649,13 @@ pub fn run() {
             PARKED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert("manager".to_string(), None);
+                .insert(
+                    "manager".to_string(),
+                    Parked {
+                        saved: None,
+                        reason: ParkReason::Dismissed,
+                    },
+                );
             // Same PHYSICAL re-park as the answer overlay above.
             if let Err(e) =
                 manager.set_position(tauri::PhysicalPosition::new(OFFSCREEN_XY, OFFSCREEN_XY))
@@ -665,16 +814,11 @@ pub fn run() {
                     api.prevent_close();
                     // Park off-screen (not hide()) so re-revealing it never shows a
                     // black box — same reason as the toggle key (tauri#14189).
-                    // Trust the ✕ press over the bookkeeping: if a shell quirk put
-                    // the window on-screen while PARKED still listed it, the park
-                    // would no-op and the ✕ would do nothing — purge the stale
-                    // entry first so the window is parked unconditionally.
+                    // Dismissed: only its own open button brings it back, never
+                    // Ctrl+Shift+H. Geometry-trusting park makes the press work
+                    // even when stale bookkeeping already lists the window.
                     if let Some(w) = window.app_handle().get_webview_window(label) {
-                        PARKED
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(label);
-                        park_offscreen(&w);
+                        park_offscreen(&w, ParkReason::Dismissed);
                     }
                 }
                 return;
