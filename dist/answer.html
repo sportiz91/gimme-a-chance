@@ -26,9 +26,10 @@
       justify-content: space-between;
       padding: 0 12px;
       background: rgba(30, 30, 30, 0.95);
-      cursor: grab;
+      /* No grab/grabbing cursor — the cursor must never mutate over the
+         invisible overlay (screen-share viewers see the system cursor).
+         See resize.js for the full story. */
     }
-    .titlebar:active { cursor: grabbing; }
     .titlebar span { font-size: 11px; opacity: 0.5; }
     .titlebar button {
       padding: 0 8px;
@@ -64,6 +65,7 @@
   <!-- Classic script on purpose: the inline script below calls
        createAnswerStack() at parse time, before deferred modules run. -->
   <script src="answer-stack.js"></script>
+  <script src="resize.js" defer></script>
   <script type="module">
     import * as smd from './smd.js';
     window.smd = smd;

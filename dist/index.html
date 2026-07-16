@@ -29,9 +29,11 @@
       justify-content: space-between;
       padding: 0 12px;
       background: rgba(30, 30, 30, 0.95);
-      cursor: grab;
+      /* No grab/grabbing cursor: screen-share viewers see the system cursor,
+         and one that mutates over an invisible window betrays the overlay.
+         Dragging still works (data-tauri-drag-region) — the OS move loop
+         never changes the cursor. Same reason resize.js exists. */
     }
-    .titlebar:active { cursor: grabbing; }
     .titlebar span { font-size: 11px; opacity: 0.5; }
 
     .container {
@@ -352,6 +354,7 @@
   <!-- Classic script on purpose: the main inline script calls
        createAnswerStack() at parse time, before deferred modules run. -->
   <script src="answer-stack.js"></script>
+  <script src="resize.js" defer></script>
   <script type="module">
     // smd.js (streaming-markdown) is an ES module; expose it for the classic
     // main script below. Module scripts run deferred, but smd is only used

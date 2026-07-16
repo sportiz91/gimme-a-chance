@@ -25,9 +25,10 @@
       justify-content: space-between;
       padding: 0 12px;
       background: rgba(30, 30, 30, 0.95);
-      cursor: grab;
+      /* No grab/grabbing cursor — the cursor must never mutate over the
+         invisible overlay (screen-share viewers see the system cursor).
+         See resize.js for the full story. */
     }
-    .titlebar:active { cursor: grabbing; }
     .titlebar span { font-size: 11px; opacity: 0.5; }
     .titlebar button {
       padding: 0 8px;
@@ -185,6 +186,7 @@
     .modal p { font-size: 12px; opacity: 0.7; margin-bottom: 14px; }
     .modal .actions { justify-content: flex-end; }
   </style>
+  <script src="resize.js" defer></script>
 </head>
 <body>
   <div class="titlebar" data-tauri-drag-region>

@@ -447,7 +447,12 @@ pub fn run() {
             // (tauri#14189). `reveal_onscreen` brings it in; `park_offscreen` sends
             // it back out.
             .position(f64::from(OFFSCREEN_CREATE_XY), f64::from(OFFSCREEN_CREATE_XY))
-            .resizable(true)
+            // NOT natively resizable (same for all overlays): Tauri's
+            // undecorated-resize child window makes Windows paint the OS
+            // resize arrows, which screen-share viewers see mutate over an
+            // "empty" patch of screen. resize.js + `commands::begin_resize`
+            // reimplement edge-resize with a plain arrow cursor.
+            .resizable(false)
             .transparent(true)
             .decorations(false)
             .always_on_top(true)
@@ -489,7 +494,8 @@ pub fn run() {
             .title("gimme — interviews")
             .inner_size(920.0, 640.0)
             .position(f64::from(OFFSCREEN_CREATE_XY), f64::from(OFFSCREEN_CREATE_XY))
-            .resizable(true)
+            // Manual resize via resize.js — see the answer builder above.
+            .resizable(false)
             .transparent(true)
             .decorations(false)
             .always_on_top(true)
@@ -645,6 +651,9 @@ pub fn run() {
             commands::delete_session,
             commands::export_session_md,
             commands::inject_session_context,
+            commands::begin_resize,
+            commands::resize_tick,
+            commands::end_resize,
         ])
         .on_window_event(|window, event| {
             // The auxiliary overlays (answer pop-out, interview manager) are

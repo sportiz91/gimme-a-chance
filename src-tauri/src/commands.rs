@@ -991,6 +991,154 @@ pub async fn open_manager_window(app: tauri::AppHandle) -> Result<(), AppError> 
     Ok(())
 }
 
+/// The one live manual edge-resize drag (one mouse, one cursor — one drag).
+///
+/// The overlays are `resizable(false)` on purpose: Tauri's undecorated-resize
+/// support answers the OS hit-test with HTLEFT/… codes, so Windows paints the
+/// resize arrows on hover and pins them for the whole modal sizing loop — a
+/// cursor mutation that screen-share viewers see over an "empty" patch of
+/// screen, betraying the invisible overlay. Instead, resize.js lays invisible
+/// strips along the window edges and streams pointer ticks through
+/// `begin_resize` / `resize_tick` / `end_resize`, which resize the window with
+/// plain window moves. No OS sizing loop, no cursor change, ever.
+static RESIZE_DRAG: std::sync::Mutex<Option<ResizeDrag>> = std::sync::Mutex::new(None);
+
+struct ResizeDrag {
+    label: String,
+    /// Which edge is being dragged, per axis: -1 = left/top, +1 = right/bottom,
+    /// 0 = that axis is untouched.
+    horiz: i8,
+    vert: i8,
+    /// Everything below is the drag-start snapshot, in physical pixels. Each
+    /// tick recomputes the whole rect from here + the cursor's absolute
+    /// travel, so ticks are idempotent and lost ones don't skew the result.
+    start_cursor: tauri::PhysicalPosition<f64>,
+    start_pos: tauri::PhysicalPosition<i32>,
+    start_size: tauri::PhysicalSize<u32>,
+}
+
+/// The `edge` strings resize.js sends, as (horiz, vert) drag directions.
+fn parse_edge(edge: &str) -> Option<(i8, i8)> {
+    match edge {
+        "n" => Some((0, -1)),
+        "s" => Some((0, 1)),
+        "w" => Some((-1, 0)),
+        "e" => Some((1, 0)),
+        "nw" => Some((-1, -1)),
+        "ne" => Some((1, -1)),
+        "sw" => Some((-1, 1)),
+        "se" => Some((1, 1)),
+        _ => None,
+    }
+}
+
+/// Logical minimum inner size per overlay — small enough to tuck away, large
+/// enough that the titlebar/toolbar rows stay usable.
+fn min_inner_size(label: &str) -> (f64, f64) {
+    match label {
+        "main" => (480.0, 280.0),
+        "manager" => (420.0, 260.0),
+        // The answer pop-out (and any future overlay).
+        _ => (300.0, 200.0),
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+#[tracing::instrument(skip(window), fields(label = window.label()))]
+pub fn begin_resize(window: tauri::WebviewWindow, edge: String) -> Result<(), AppError> {
+    use anyhow::Context;
+    let (horiz, vert) = parse_edge(&edge)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown resize edge: {edge}")))?;
+    let drag = ResizeDrag {
+        label: window.label().to_string(),
+        horiz,
+        vert,
+        start_cursor: window.cursor_position().context("cursor position")?,
+        start_pos: window.outer_position().context("window position")?,
+        start_size: window.inner_size().context("window size")?,
+    };
+    *RESIZE_DRAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(drag);
+    Ok(())
+}
+
+/// One pointer-move tick of a manual resize. The cursor is read Rust-side and
+/// all math stays in physical pixels, so the frontend never touches
+/// devicePixelRatio. When the minimum size clamps the drag, the opposite edge
+/// stays pinned (a left-edge drag never shoves the right edge around).
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+// Physical pixel values round-tripped through f64 fit i32/u32 comfortably.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn resize_tick(window: tauri::WebviewWindow) -> Result<(), AppError> {
+    use anyhow::Context;
+    let guard = RESIZE_DRAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A tick can trail `end_resize` (it was already in flight) — ignore it.
+    let Some(drag) = guard.as_ref() else {
+        return Ok(());
+    };
+    if drag.label != window.label() {
+        return Ok(());
+    }
+
+    let cursor = window.cursor_position().context("cursor position")?;
+    let dx = cursor.x - drag.start_cursor.x;
+    let dy = cursor.y - drag.start_cursor.y;
+
+    let scale = window.scale_factor().context("scale factor")?;
+    let (min_w, min_h) = min_inner_size(&drag.label);
+    let (min_w, min_h) = (min_w * scale, min_h * scale);
+
+    let start_w = f64::from(drag.start_size.width);
+    let start_h = f64::from(drag.start_size.height);
+    let mut w = start_w;
+    let mut h = start_h;
+    let mut x = f64::from(drag.start_pos.x);
+    let mut y = f64::from(drag.start_pos.y);
+    match drag.horiz {
+        1 => w = (start_w + dx).max(min_w),
+        -1 => {
+            w = (start_w - dx).max(min_w);
+            x += start_w - w;
+        }
+        _ => {}
+    }
+    match drag.vert {
+        1 => h = (start_h + dy).max(min_h),
+        -1 => {
+            h = (start_h - dy).max(min_h);
+            y += start_h - h;
+        }
+        _ => {}
+    }
+
+    // Position first on left/top drags so the window never paints a frame at
+    // the old origin with the new size.
+    if drag.horiz == -1 || drag.vert == -1 {
+        window
+            .set_position(tauri::PhysicalPosition::new(
+                x.round() as i32,
+                y.round() as i32,
+            ))
+            .context("set position")?;
+    }
+    window
+        .set_size(tauri::PhysicalSize::new(w.round() as u32, h.round() as u32))
+        .context("set size")?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn end_resize() {
+    *RESIZE_DRAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// Every recorded interview, newest first — the manager's left pane.
 #[tauri::command]
 pub async fn list_sessions() -> Result<Vec<storage::SessionSummary>, AppError> {

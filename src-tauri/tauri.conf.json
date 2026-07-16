@@ -18,7 +18,7 @@
                 "title": "gimme-a-chance",
                 "width": 1000,
                 "height": 720,
-                "resizable": true,
+                "resizable": false,
                 "transparent": true,
                 "decorations": false,
                 "alwaysOnTop": true,
