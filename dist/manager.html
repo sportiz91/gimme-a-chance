@@ -6,6 +6,13 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    /* Stealth: no hand on buttons/rows — the system cursor is composited
+       into screen shares. The manager is an offline annotation surface
+       (not shared live), so its editable fields keep their I-beam below:
+       there the cursor is genuine editing affordance, not a leak. */
+    * { cursor: default !important; }
+    #title, #description, #context { cursor: text !important; }
+
     html, body { height: 100%; }
     body {
       font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;

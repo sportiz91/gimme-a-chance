@@ -6,6 +6,13 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    /* Stealth: the system cursor is composited into screen shares, so over
+       this invisible overlay it must never turn into anything but the plain
+       arrow — no hand on buttons, no resize arrows. !important beats the
+       per-element rules (and answer-stack.css). Drag/resize still work —
+       neither depends on the cursor shape. See resize.js. */
+    * { cursor: default !important; }
+
     html, body { height: 100%; }
     body {
       font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
