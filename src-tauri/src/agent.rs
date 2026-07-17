@@ -54,12 +54,30 @@ fn label(speaker: &str) -> &'static str {
     }
 }
 
+/// One transcript line exactly as it appears in the prompt: `[mm:ss] Label:
+/// text` (mm is unbounded past the hour). Factored so the push-time token
+/// count sees the same bytes `transcript_text` will send.
+fn format_line(t_s: u64, speaker: &str, text: &str) -> String {
+    format!(
+        "[{:02}:{:02}] {}: {}",
+        t_s / 60,
+        t_s % 60,
+        label(speaker),
+        text
+    )
+}
+
 pub struct AgentSession {
     started: Instant,
     lines: Mutex<Vec<TranscriptLine>>,
     /// Total transcript chars ever appended — the cheap token estimator
     /// (~4 chars/token) driving the refresh trigger and the debug meter.
     chars_total: AtomicU64,
+    /// o200k tokens of every formatted line ever appended (+1/line for the
+    /// newline join) — the context meter's live estimate of transcript size.
+    /// Real, precise counts (unlike `chars_total`): counted at push time by
+    /// the same tokenizer family the answering models use.
+    line_tokens: AtomicU64,
     /// The Interview State document (markdown). Empty until the first refresh.
     state_block: Mutex<String>,
     /// `lines.len()` at the last successful refresh — the next refresh reads
@@ -78,6 +96,7 @@ impl Default for AgentSession {
             started: Instant::now(),
             lines: Mutex::new(Vec::new()),
             chars_total: AtomicU64::new(0),
+            line_tokens: AtomicU64::new(0),
             state_block: Mutex::new(String::new()),
             state_covered_lines: AtomicU64::new(0),
             chars_at_refresh: AtomicU64::new(0),
@@ -93,6 +112,11 @@ impl AgentSession {
     /// due.
     fn push(&self, speaker: &'static str, text: &str) -> (u64, bool) {
         let t_s = self.elapsed_s();
+        // Count the line as the prompt will contain it (label prefix + the
+        // newline join). Sub-ms for speech lines; a 100k-char injection pays
+        // a few ms on the command thread, not on any audio path.
+        let toks = crate::context_meter::count_tokens(&format_line(t_s, speaker, text)) + 1;
+        self.line_tokens.fetch_add(toks, Ordering::Relaxed);
         if let Ok(mut lines) = self.lines.lock() {
             lines.push(TranscriptLine {
                 speaker,
@@ -123,18 +147,16 @@ impl AgentSession {
         };
         let text = lines
             .iter()
-            .map(|l| {
-                format!(
-                    "[{:02}:{:02}] {}: {}",
-                    l.t_s / 60,
-                    l.t_s % 60,
-                    label(l.speaker),
-                    l.text
-                )
-            })
+            .map(|l| format_line(l.t_s, l.speaker, &l.text))
             .collect::<Vec<_>>()
             .join("\n");
         (text, lines.len())
+    }
+
+    /// Running o200k estimate of the transcript's prompt size in tokens —
+    /// the context meter's live component (see `context_meter::gauge`).
+    pub fn line_tokens_total(&self) -> u64 {
+        self.line_tokens.load(Ordering::Relaxed)
     }
 
     /// Current Interview State document (empty until the first refresh lands).
@@ -263,7 +285,7 @@ fn spawn_refresh(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let t0 = Instant::now();
         match api.refresh_interview_state(&prev_state, &delta).await {
-            Ok((new_state, request_id)) => {
+            Ok((new_state, request_id, usage)) => {
                 tracing::info!(
                     target: "agent",
                     delta_chars,
@@ -274,6 +296,7 @@ fn spawn_refresh(app: &AppHandle) {
                     "interview state refreshed"
                 );
                 session.commit_state(new_state, covered_upto);
+                metrics.add_spend(usage);
                 metrics
                     .state_epoch_s
                     .store(now_epoch_s(), Ordering::Relaxed);

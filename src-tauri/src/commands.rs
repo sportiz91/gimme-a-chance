@@ -390,6 +390,7 @@ pub async fn ask_brain(
     metrics
         .last_llm_ttft_ms
         .store(outcome.ttft_ms, Ordering::Relaxed);
+    metrics.add_spend(outcome.usage);
     set_provider(&state, &outcome.provider);
     storage::record(storage::Event {
         kind: "answer",
@@ -439,6 +440,10 @@ pub async fn ask_agent(
             "nothing transcribed yet — the agent has no context to work from".into(),
         ));
     }
+    // Estimator reading at snapshot time — becomes the meter's anchor twin
+    // when this press's real usage lands (lines pushed while the request is
+    // in flight stay in the pending delta).
+    let line_tokens_at_press = state.agent.line_tokens_total();
     let state_block = state.agent.state_block();
 
     #[cfg(debug_assertions)]
@@ -461,12 +466,19 @@ pub async fn ask_agent(
     let m = &state.metrics;
     m.last_llm_ms.store(outcome.total_ms, Ordering::Relaxed);
     m.last_llm_ttft_ms.store(outcome.ttft_ms, Ordering::Relaxed);
-    m.agent_prompt_tokens
-        .store(outcome.usage.prompt, Ordering::Relaxed);
-    m.agent_cached_tokens
-        .store(outcome.usage.cached, Ordering::Relaxed);
-    m.agent_completion_tokens
-        .store(outcome.usage.completion, Ordering::Relaxed);
+    // Zero usage means the stream broke before the usage chunk — keep the
+    // previous (still valid) anchor instead of zeroing the context meter.
+    if outcome.usage.prompt > 0 {
+        m.agent_prompt_tokens
+            .store(outcome.usage.prompt, Ordering::Relaxed);
+        m.agent_cached_tokens
+            .store(outcome.usage.cached, Ordering::Relaxed);
+        m.agent_completion_tokens
+            .store(outcome.usage.completion, Ordering::Relaxed);
+        m.agent_anchor_line_tokens
+            .store(line_tokens_at_press, Ordering::Relaxed);
+    }
+    m.add_spend(outcome.usage);
     set_provider(&state, &format!("agent/{}", outcome.model));
 
     // The one JSONL line that reconstructs a press: prompt shape, cache hit
@@ -738,6 +750,7 @@ pub async fn describe_queue(
             return Err(AppError::Vision(e.to_string()));
         }
     };
+    state.metrics.add_spend(outcome.usage);
 
     // gpt-4o-mini deterministically refused some multi-shot desktop captures
     // that gpt-5.5 handled fine (measured 2/2 vs 0/2 on dumped shots). Rather
@@ -758,7 +771,10 @@ pub async fn describe_queue(
             )
             .await
         {
-            Ok(o) => outcome = o,
+            Ok(o) => {
+                state.metrics.add_spend(o.usage);
+                outcome = o;
+            }
             Err(e) => tracing::warn!(error = %e, "gpt-5.5 retry failed; keeping the refusal text"),
         }
     }
@@ -1321,6 +1337,15 @@ pub async fn export_session_md(session_id: String) -> Result<String, AppError> {
     Ok(path.display().to_string())
 }
 
+/// What `inject_session_context` reports back to the manager UI: the injected
+/// context's size in chars and in o200k-estimated tokens (what it will weigh
+/// inside the agent prompt).
+#[derive(serde::Serialize)]
+pub struct InjectOutcome {
+    pub chars: usize,
+    pub est_tokens: u64,
+}
+
 /// Load a past session's saved context into the LIVE interview. Three sinks,
 /// same as any ingested clip: the agent's transcript (`ask_agent`), the main
 /// window's rolling context store via `clipboard-text` (`ask_brain` + the
@@ -1331,7 +1356,7 @@ pub async fn export_session_md(session_id: String) -> Result<String, AppError> {
 pub async fn inject_session_context(
     app: tauri::AppHandle,
     session_id: String,
-) -> Result<usize, AppError> {
+) -> Result<InjectOutcome, AppError> {
     let text = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<String> {
         let context = storage::session_context(&storage::open_management()?, &session_id)?;
         context
@@ -1340,6 +1365,7 @@ pub async fn inject_session_context(
     })
     .await
     .map_err(|e| anyhow::anyhow!("db task join: {e}"))??;
+    let est_tokens = crate::context_meter::count_tokens(&text);
     crate::agent::push_line_tagged(&app, "clipboard", "context", &text);
     _ = app.emit_to(
         "main",
@@ -1348,7 +1374,81 @@ pub async fn inject_session_context(
     );
     tracing::info!(
         chars = text.len(),
+        est_tokens,
         "saved context injected into live session"
     );
-    Ok(text.len())
+    Ok(InjectOutcome {
+        chars: text.len(),
+        est_tokens,
+    })
+}
+
+/// What the warm ping reports back to the manager UI.
+#[derive(serde::Serialize)]
+pub struct WarmOutcome {
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+/// The manager's "⚖️ verify + warm" button: send the agent prompt exactly as
+/// the next press would (1-token output cap, non-streaming) to get the
+/// server's EXACT context size — re-anchoring the context meter — and prime
+/// `OpenAI`'s prompt cache so the first real press starts from a warm prefix.
+/// Costs one uncached read of the prompt; worth it right after a 💉 context
+/// injection, pointless more than ~5-10 idle minutes before the interview.
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub async fn warm_agent_context(
+    state: tauri::State<'_, AppState>,
+) -> Result<WarmOutcome, AppError> {
+    let language = state
+        .language
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let brain = state
+        .brain_model
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let style = state
+        .response_style
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+
+    let (transcript, _lines) = state.agent.transcript_text();
+    if transcript.is_empty() {
+        return Err(AppError::Llm(
+            "the agent context is empty — nothing to weigh yet".into(),
+        ));
+    }
+    let line_tokens_at_press = state.agent.line_tokens_total();
+    let state_block = state.agent.state_block();
+
+    let (usage, request_id) = state
+        .api
+        .warm_agent(&transcript, &state_block, language, brain, style)
+        .await
+        .map_err(|e| AppError::Llm(e.to_string()))?;
+
+    // Same anchor update as a real press (warm_agent guarantees prompt > 0).
+    // `agent_completion_tokens` stays — the ping's 1-token answer is noise.
+    let m = &state.metrics;
+    m.agent_prompt_tokens.store(usage.prompt, Ordering::Relaxed);
+    m.agent_cached_tokens.store(usage.cached, Ordering::Relaxed);
+    m.agent_anchor_line_tokens
+        .store(line_tokens_at_press, Ordering::Relaxed);
+    m.add_spend(usage);
+
+    tracing::info!(
+        prompt_tokens = usage.prompt,
+        cached_tokens = usage.cached,
+        request_id = request_id.as_deref().unwrap_or("-"),
+        "context warm ping done"
+    );
+    Ok(WarmOutcome {
+        prompt_tokens: usage.prompt,
+        cached_tokens: usage.cached,
+    })
 }

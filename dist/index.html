@@ -44,6 +44,17 @@
     }
     .titlebar span { font-size: 11px; opacity: 0.5; }
 
+    /* Context meter — always visible in the titlebar: how many tokens the
+       brain's context holds vs the model's window. Monospace + tabular so the
+       number doesn't jitter as it grows. */
+    .titlebar .ctx-meter {
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 10px;
+      opacity: 0.55;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
     .container {
       padding: 12px;
       display: flex;
@@ -375,6 +386,8 @@
 <body>
   <div class="titlebar" data-tauri-drag-region>
     <span>gimme-a-chance</span>
+    <span class="ctx-meter" id="ctxMeter"
+      title="Brain context: tokens in the agent's context / model window. ~ = includes a local estimate the API hasn't confirmed yet (no press since the last ingest)">ctx —</span>
     <div class="status">
       <div class="dot" id="statusDot"></div>
       <span id="statusText">Idle</span>
@@ -492,6 +505,7 @@
     <div class="row"><span class="key">transcript</span><span class="val" id="dbgTranscript">—</span></div>
     <div class="row"><span class="key">agent ctx</span><span class="val" id="dbgAgentCtx">—</span></div>
     <div class="row"><span class="key">agent cached</span><span class="val" id="dbgAgentCached">—</span></div>
+    <div class="row"><span class="key">session spend</span><span class="val" id="dbgSpend">—</span></div>
     <div class="row"><span class="key">state age</span><span class="val" id="dbgStateAge">—</span></div>
     <div class="row"><span class="key">heap live</span><span class="val" id="dbgHeapLive">—</span></div>
     <div class="row"><span class="key">heap peak</span><span class="val" id="dbgHeapPeak">—</span></div>
@@ -1133,6 +1147,12 @@
       return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
     }
 
+    function fmtTok(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    }
+
     listen('metrics', (event) => {
       const m = event.payload;
       const setCell = (id, us, warnUs, badUs) => {
@@ -1166,6 +1186,21 @@
       document.getElementById('dbgStateAge').textContent = m.state_epoch_s
         ? Math.max(0, Math.round(Date.now() / 1000 - m.state_epoch_s)) + 's ago'
         : 'never';
+      document.getElementById('dbgSpend').textContent = m.total_prompt_tokens
+        ? `${fmtTok(m.total_prompt_tokens)} in (${fmtTok(m.total_cached_tokens)} cached) / ${fmtTok(m.total_completion_tokens)} out`
+        : '—';
+
+      // Titlebar context meter: tokens in the brain's context vs the model
+      // window, codex-style % free. `~` while part of the number is a local
+      // o200k estimate the API hasn't confirmed yet.
+      if (m.context_window_tokens) {
+        const used = m.context_used_tokens || 0;
+        const free = Math.max(0, Math.min(100,
+          Math.round(100 - (100 * used) / m.context_window_tokens)));
+        const approx = m.context_pending_tokens > 0 ? '~' : '';
+        document.getElementById('ctxMeter').textContent =
+          `ctx ${approx}${fmtTok(used)}/${fmtTok(m.context_window_tokens)} · ${free}% free`;
+      }
 
       // Allocator label is always populated — it's compile-time constant.
       document.getElementById('dbgAllocator').textContent = m.allocator_name || '—';

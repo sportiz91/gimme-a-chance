@@ -37,6 +37,11 @@ clipboard-master = "4"
 # (SendInput) is the synthetic-Ctrl+C fallback for apps without UIA text support.
 uiautomation = "0.25"
 enigo = "0.6"
+# Context meter: local o200k_base token counts (the tokenizer of the whole
+# gpt-4o/gpt-5 family) for everything ingested into the agent context — the
+# live estimate between presses; the API's real `usage` re-anchors it on every
+# call. See context_meter.rs.
+tiktoken-rs = "0.12"
 # Secrets: in-memory protection (SecretString) + at-rest OS keyring.
 secrecy = "0.8"
 keyring = { version = "3", features = ["windows-native"] }

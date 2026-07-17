@@ -9,6 +9,7 @@ mod capture;
 mod clipboard;
 mod cloud_stt;
 mod commands;
+mod context_meter;
 mod crashlog;
 #[cfg(feature = "sherpa")]
 mod dtln;
@@ -700,6 +701,10 @@ pub fn run() {
             // loop blocks for the app's lifetime.
             clipboard::spawn_watcher(app.handle().clone(), auto_clip, manual_copy, last_clip);
 
+            // Build the o200k tokenizer off-thread now so the first transcript
+            // line (STT worker) never pays the ~100ms BPE init.
+            context_meter::warmup();
+
             // Periodic metrics emitter: every 2s push a snapshot to the frontend
             // so the debug panel can refresh without polling. `setup` runs before
             // Tokio's reactor is available, so use Tauri's async runtime which
@@ -766,6 +771,22 @@ pub fn run() {
                         }
                     }
 
+                    // Refresh the context meter into the atomics the snapshot
+                    // carries (same pattern as the heap counters above).
+                    {
+                        use std::sync::atomic::Ordering;
+                        let gauge = context_meter::gauge(&emitter_app.state::<AppState>());
+                        metrics_for_emitter
+                            .context_used_tokens
+                            .store(gauge.used, Ordering::Relaxed);
+                        metrics_for_emitter
+                            .context_pending_tokens
+                            .store(gauge.pending, Ordering::Relaxed);
+                        metrics_for_emitter
+                            .context_window_tokens
+                            .store(gauge.window, Ordering::Relaxed);
+                    }
+
                     let snapshot = metrics_for_emitter.snapshot();
                     _ = emitter_app.emit("metrics", snapshot);
                 }
@@ -805,6 +826,7 @@ pub fn run() {
             commands::delete_session,
             commands::export_session_md,
             commands::inject_session_context,
+            commands::warm_agent_context,
             commands::begin_resize,
             commands::resize_tick,
             commands::end_resize,

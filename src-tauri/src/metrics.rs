@@ -42,6 +42,22 @@ pub struct Metrics {
     pub agent_prompt_tokens: AtomicU64,
     pub agent_cached_tokens: AtomicU64,
     pub agent_completion_tokens: AtomicU64,
+    // Context meter. `agent_prompt_tokens` above doubles as the usage ANCHOR
+    // (the server-confirmed context size at the last agent press / warm ping);
+    // `agent_anchor_line_tokens` records `AgentSession::line_tokens_total()`
+    // at that same moment, so the live estimate only spans lines added since.
+    // The three `context_*` gauges are refreshed each emitter tick by
+    // `context_meter::gauge` (same pattern as the heap counters).
+    pub agent_anchor_line_tokens: AtomicU64,
+    pub context_used_tokens: AtomicU64,
+    pub context_pending_tokens: AtomicU64,
+    pub context_window_tokens: AtomicU64,
+    // Whole-session spend, accumulated from EVERY API call (asks, agent
+    // presses, vision describes, state refreshes, warm pings) — the codex
+    // "total" twin of the "live context" number above.
+    pub total_prompt_tokens: AtomicU64,
+    pub total_cached_tokens: AtomicU64,
+    pub total_completion_tokens: AtomicU64,
     // Heap fields are always present but only populated when `counting-alloc`
     // is active. When the feature is off they stay at 0 and the UI shows "—".
     pub heap_live_bytes: AtomicU64,
@@ -72,6 +88,13 @@ impl Default for Metrics {
             agent_prompt_tokens: AtomicU64::new(0),
             agent_cached_tokens: AtomicU64::new(0),
             agent_completion_tokens: AtomicU64::new(0),
+            agent_anchor_line_tokens: AtomicU64::new(0),
+            context_used_tokens: AtomicU64::new(0),
+            context_pending_tokens: AtomicU64::new(0),
+            context_window_tokens: AtomicU64::new(0),
+            total_prompt_tokens: AtomicU64::new(0),
+            total_cached_tokens: AtomicU64::new(0),
+            total_completion_tokens: AtomicU64::new(0),
             heap_live_bytes: AtomicU64::new(0),
             heap_total_allocated_bytes: AtomicU64::new(0),
             heap_peak_live_bytes: AtomicU64::new(0),
@@ -84,6 +107,16 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Fold one API call's token usage into the session spend counters.
+    pub fn add_spend(&self, usage: crate::backend::TokenUsage) {
+        self.total_prompt_tokens
+            .fetch_add(usage.prompt, Ordering::Relaxed);
+        self.total_cached_tokens
+            .fetch_add(usage.cached, Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(usage.completion, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load_array = |arr: &[AtomicU64; BUCKET_COUNT]| -> [u64; BUCKET_COUNT] {
             let mut out = [0_u64; BUCKET_COUNT];
@@ -114,6 +147,12 @@ impl Metrics {
             agent_prompt_tokens: self.agent_prompt_tokens.load(Ordering::Relaxed),
             agent_cached_tokens: self.agent_cached_tokens.load(Ordering::Relaxed),
             agent_completion_tokens: self.agent_completion_tokens.load(Ordering::Relaxed),
+            context_used_tokens: self.context_used_tokens.load(Ordering::Relaxed),
+            context_pending_tokens: self.context_pending_tokens.load(Ordering::Relaxed),
+            context_window_tokens: self.context_window_tokens.load(Ordering::Relaxed),
+            total_prompt_tokens: self.total_prompt_tokens.load(Ordering::Relaxed),
+            total_cached_tokens: self.total_cached_tokens.load(Ordering::Relaxed),
+            total_completion_tokens: self.total_completion_tokens.load(Ordering::Relaxed),
             heap_live_bytes: self.heap_live_bytes.load(Ordering::Relaxed),
             heap_total_allocated_bytes: self.heap_total_allocated_bytes.load(Ordering::Relaxed),
             heap_peak_live_bytes: self.heap_peak_live_bytes.load(Ordering::Relaxed),
@@ -191,6 +230,12 @@ pub struct MetricsSnapshot {
     pub agent_prompt_tokens: u64,
     pub agent_cached_tokens: u64,
     pub agent_completion_tokens: u64,
+    pub context_used_tokens: u64,
+    pub context_pending_tokens: u64,
+    pub context_window_tokens: u64,
+    pub total_prompt_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub total_completion_tokens: u64,
     pub heap_live_bytes: u64,
     pub heap_total_allocated_bytes: u64,
     pub heap_peak_live_bytes: u64,

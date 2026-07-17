@@ -339,6 +339,9 @@ pub struct ApiOutcome {
     pub total_ms: u64,
     /// Which provider actually answered, e.g. `groq/llama-3.1-8b-instant`.
     pub provider: String,
+    /// Session-spend accounting. `OpenAI` reports it via `include_usage`,
+    /// Groq unprompted under `x_groq`; zeroed if the stream broke early.
+    pub usage: TokenUsage,
 }
 
 /// Token accounting from the final SSE chunk (`stream_options.include_usage`).
@@ -349,6 +352,19 @@ pub struct TokenUsage {
     pub prompt: u64,
     pub cached: u64,
     pub completion: u64,
+}
+
+impl TokenUsage {
+    /// Parse an `OpenAI`-style `usage` object (the chat/completions shape;
+    /// Groq's `x_groq.usage` uses the same field names).
+    fn from_json(u: &Value) -> Self {
+        let field = |ptr: &str| u.pointer(ptr).and_then(Value::as_u64).unwrap_or(0);
+        Self {
+            prompt: field("/prompt_tokens"),
+            cached: field("/prompt_tokens_details/cached_tokens"),
+            completion: field("/completion_tokens"),
+        }
+    }
 }
 
 /// Result of one agent press.
@@ -376,6 +392,9 @@ pub struct VisionOutcome {
     pub text: String,
     pub ttft_ms: u64,
     pub total_ms: u64,
+    /// Session-spend accounting (includes the image-tile tokens, which only
+    /// the server can price).
+    pub usage: TokenUsage,
 }
 
 /// Streamed content delta emitted to the frontend (same payload for answer & vision;
@@ -481,6 +500,17 @@ impl BrainModel {
         }
     }
 
+    /// The model an AGENT press resolves to: `Auto` (the speed-first
+    /// auto-answer chain) upgrades to gpt-5.5; a pinned gpt-4o-mini is
+    /// honored. Also the model whose context window the meter shows.
+    #[must_use]
+    pub fn agent_model_id(self) -> &'static str {
+        match self {
+            Self::Gpt4oMini => "gpt-4o-mini",
+            Self::Auto | Self::Gpt55 => "gpt-5.5",
+        }
+    }
+
     #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
@@ -499,6 +529,32 @@ impl BrainModel {
             _ => None,
         }
     }
+}
+
+/// Advertised context window (tokens) of an answering model — the context
+/// meter's denominator. Unknown models get the conservative 128K floor.
+#[must_use]
+pub fn context_window(model: &str) -> u64 {
+    match model {
+        "gpt-5.5" => 1_050_000,
+        // gpt-4o-mini and anything unrecognized.
+        _ => 128_000,
+    }
+}
+
+/// o200k token count of the fixed parts of the NEXT agent prompt (styled
+/// system + volatile tail) — the pre-first-press share of the context meter
+/// that per-line counts don't cover. Kept here because the prompt builders
+/// are private to this module.
+#[must_use]
+pub fn agent_prompt_base_tokens(
+    language: Language,
+    style: ResponseStyle,
+    state_block: &str,
+) -> u64 {
+    let system = styled_system(agent_system(language), language, style);
+    crate::context_meter::count_tokens(&system)
+        + crate::context_meter::count_tokens(&agent_tail(state_block, language))
 }
 
 /// How answers are WORDED. Selected in the UI. `Normal` keeps the prompts
@@ -650,7 +706,7 @@ impl ApiBackend {
         .await
         .map_err(|_| anyhow!("connect timed out"))??;
 
-        let (answer, ttft_ms, total_ms, _usage) =
+        let (answer, ttft_ms, total_ms, usage) =
             stream_sse_content(resp, "answer-delta", trace_id, app, t0, FIRST_TOKEN_TIMEOUT)
                 .await?;
         Ok(ApiOutcome {
@@ -658,6 +714,7 @@ impl ApiBackend {
             ttft_ms,
             total_ms,
             provider: p.name.to_string(),
+            usage,
         })
     }
 
@@ -710,7 +767,7 @@ impl ApiBackend {
         .await
         .map_err(|_| anyhow!("connect timed out"))??;
 
-        let (text, ttft_ms, total_ms, _usage) = stream_sse_content(
+        let (text, ttft_ms, total_ms, usage) = stream_sse_content(
             resp,
             "vision-delta",
             trace_id,
@@ -736,6 +793,7 @@ impl ApiBackend {
             text,
             ttft_ms,
             total_ms,
+            usage,
         })
     }
 
@@ -758,10 +816,7 @@ impl ApiBackend {
             .openai
             .as_ref()
             .ok_or_else(|| anyhow!("agent mode needs OPENAI_API_KEY (not set)"))?;
-        let model = match brain {
-            BrainModel::Gpt4oMini => "gpt-4o-mini",
-            BrainModel::Auto | BrainModel::Gpt55 => "gpt-5.5",
-        };
+        let model = brain.agent_model_id();
         let mut body = agent_body(
             model,
             &styled_system(agent_system(language), language, style),
@@ -804,12 +859,12 @@ impl ApiBackend {
     }
 
     /// One Interview State update on the cheap sibling model (non-streaming,
-    /// background). Returns `(new state document, x-request-id)`.
+    /// background). Returns `(new state document, x-request-id, usage)`.
     pub async fn refresh_interview_state(
         &self,
         prev_state: &str,
         delta: &str,
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<(String, Option<String>, TokenUsage)> {
         let key = self
             .openai
             .as_ref()
@@ -822,6 +877,10 @@ impl ApiBackend {
         let user = format!("Previous state document:\n{prev}\n\nNew transcript lines:\n{delta}");
         let mut body = chat_body(STATE_MODEL, STATE_SYS, json!(user), STATE_MAX_OUT, 0.2);
         body["stream"] = json!(false);
+        // `stream_options` is only legal on streaming requests.
+        if let Some(o) = body.as_object_mut() {
+            o.remove("stream_options");
+        }
         body["reasoning_effort"] = json!("low");
         let resp = tokio::time::timeout(
             STATE_TIMEOUT,
@@ -850,7 +909,80 @@ impl ApiBackend {
         if text.is_empty() {
             bail!("state refresh returned empty content");
         }
-        Ok((text, request_id))
+        let usage = v
+            .get("usage")
+            .map(TokenUsage::from_json)
+            .unwrap_or_default();
+        Ok((text, request_id, usage))
+    }
+
+    /// Weigh-in ping (the manager's "⚖️ verify + warm" button): send the agent
+    /// prompt EXACTLY as the next press would, non-streaming, output capped to
+    /// a single token. Two payoffs for one request: the server's exact
+    /// `usage.prompt_tokens` re-anchors the context meter (the number the user
+    /// wants right after a 💉 context injection), and the prefill primes
+    /// `OpenAI`'s prompt cache so the first real press starts from a warm
+    /// prefix — lower TTFT, cached input rate. Costs one uncached read of the
+    /// prompt; the cache warm only survives ~5-10 min of inactivity.
+    pub async fn warm_agent(
+        &self,
+        transcript: &str,
+        state_block: &str,
+        language: Language,
+        brain: BrainModel,
+        style: ResponseStyle,
+    ) -> Result<(TokenUsage, Option<String>)> {
+        let key = self
+            .openai
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent mode needs OPENAI_API_KEY (not set)"))?;
+        let model = brain.agent_model_id();
+        let mut body = agent_body(
+            model,
+            &styled_system(agent_system(language), language, style),
+            transcript,
+            &agent_tail(state_block, language),
+        );
+        body["stream"] = json!(false);
+        if let Some(o) = body.as_object_mut() {
+            o.remove("stream_options");
+        }
+        // The answer is waste — only the usage receipt matters. 1 visible
+        // token is the legal minimum, and the cap also stops gpt-5.5 from
+        // spending reasoning tokens before the cutoff.
+        if model.starts_with("gpt-5") {
+            body["max_completion_tokens"] = json!(1);
+        } else {
+            body["max_tokens"] = json!(1);
+        }
+        let resp = tokio::time::timeout(
+            // Latency-uncritical background call, but a cold prefill over a
+            // long transcript takes a while — same budget as a state refresh.
+            STATE_TIMEOUT,
+            self.client
+                .post(OPENAI_URL)
+                .bearer_auth(key.expose_secret())
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow!("warm ping timed out"))??;
+        let request_id = openai_request_id(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            bail!("HTTP {status}: {snippet}");
+        }
+        let v: Value = resp.json().await?;
+        let usage = v
+            .get("usage")
+            .map(TokenUsage::from_json)
+            .unwrap_or_default();
+        if usage.prompt == 0 {
+            bail!("warm ping returned no usage");
+        }
+        Ok((usage, request_id))
     }
 }
 
@@ -915,6 +1047,12 @@ fn chat_body(
         ],
         "stream": true,
     });
+    // OpenAI: the final pre-[DONE] chunk carries `usage` for the session
+    // spend meter. NOT sent to Groq (the fallback chain must never break
+    // over an extra param) — Groq reports usage unprompted under `x_groq`.
+    if model.starts_with("gpt-") {
+        body["stream_options"] = json!({"include_usage": true});
+    }
     // Move the (possibly multimodal) user content in — consuming it.
     body["messages"][1]["content"] = user_content;
     if model.starts_with("gpt-5") {
@@ -1002,19 +1140,12 @@ async fn stream_sse_content(
             };
             // With include_usage, the final pre-[DONE] chunk carries usage and
             // empty choices; regular chunks carry `"usage": null` — skip those.
+            // Groq streams its usage unprompted under `x_groq` instead (no
+            // `stream_options` is sent to it — see `chat_body`).
             if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                usage.prompt = u
-                    .pointer("/prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                usage.completion = u
-                    .pointer("/completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                usage.cached = u
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                usage = TokenUsage::from_json(u);
+            } else if let Some(u) = v.pointer("/x_groq/usage").filter(|u| u.is_object()) {
+                usage = TokenUsage::from_json(u);
             }
             if let Some(delta) = v
                 .pointer("/choices/0/delta/content")

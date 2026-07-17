@@ -221,6 +221,7 @@
         <div class="actions">
           <button id="saveBtn" title="Save title, description and context">💾 Save</button>
           <button id="injectBtn">💉 Load into live interview</button>
+          <button id="warmBtn" title="Send a 1-token ping with the LIVE agent context: gets the exact server-side token count and pre-warms OpenAI's prompt cache. Do it ≤5 min before the first press — the warm expires with inactivity">⚖️ Verify + warm</button>
           <button id="exportBtn" title="Write a .md file under Documents\gimme-a-chance\exports and reveal it in Explorer">📄 Export .md</button>
           <button id="deleteBtn" class="danger">🗑 Delete</button>
           <span id="status"></span>
@@ -300,6 +301,12 @@
       if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
       if (s >= 60) return `${Math.round(s / 60)} min`;
       return `${s}s`;
+    }
+
+    function fmtTok(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
     }
 
     function fmtTs(t) {
@@ -430,11 +437,32 @@
       if (!selected || selected.live) return;
       if (!(await save())) return;
       try {
-        const chars = await invoke('inject_session_context', { sessionId: selected.id });
-        status(`Context loaded into the live interview (${chars} chars) ✓`);
+        const r = await invoke('inject_session_context', { sessionId: selected.id });
+        status(`Context loaded (${r.chars} chars ≈ ${fmtTok(r.est_tokens)} tokens) ✓`);
       } catch (e) {
         status('Load into interview failed: ' + e, true);
       }
+    }
+
+    // ⚖️ Verify + warm: a 1-token ping with the LIVE agent context. The
+    // server's usage receipt is the exact token count (re-anchors the meter
+    // in the main overlay) and the prefill leaves OpenAI's prompt cache warm
+    // for the first real press. Not tied to the selected session — it weighs
+    // whatever the live context holds right now.
+    async function warmContext() {
+      const btn = $('warmBtn');
+      btn.disabled = true;
+      btn.textContent = '⚖️ Weighing…';
+      try {
+        const r = await invoke('warm_agent_context');
+        const cachedPct = r.prompt_tokens
+          ? Math.round((100 * r.cached_tokens) / r.prompt_tokens) : 0;
+        status(`Live context: ${fmtTok(r.prompt_tokens)} tokens exact (${cachedPct}% cached) · cache warmed ✓`);
+      } catch (e) {
+        status('Verify failed: ' + e, true);
+      }
+      btn.disabled = false;
+      btn.textContent = '⚖️ Verify + warm';
     }
 
     async function exportMd() {
@@ -484,6 +512,7 @@
     });
     $('saveBtn').addEventListener('click', save);
     $('injectBtn').addEventListener('click', inject);
+    $('warmBtn').addEventListener('click', warmContext);
     $('exportBtn').addEventListener('click', exportMd);
     $('deleteBtn').addEventListener('click', askDelete);
     $('cancelDeleteBtn').addEventListener('click', () => $('modalBackdrop').classList.remove('visible'));
