@@ -16,6 +16,7 @@
 //! (see [`ApiBackend::describe`]). Both share one streaming SSE reader
 //! ([`stream_sse_content`]) and one request builder ([`chat_body`]).
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -60,6 +61,56 @@ fn system_prompt(language: Language) -> &'static str {
     match language {
         Language::English => SYSTEM_PROMPT_EN,
         Language::Spanish => SYSTEM_PROMPT_ES,
+    }
+}
+
+// ── Caveman style ───────────────────────────────────────────────────────────
+//
+// Terseness addendum appended to both answer prompts when the UI selects the
+// caveman style. Distilled from the caveman-micro benchmark (an 85-token nudge
+// beat the original 552-token skill with quality held at 100%): the model
+// needs permission to drop filler, not a tutorial. The opening bold line is
+// exempt — it must stay speakable out loud. Spanish keeps articles unless
+// dropping them is unambiguous: articles carry more disambiguation in Spanish
+// than in English.
+const CAVEMAN_EN: &str = "\n\
+CAVEMAN MODE — the opening bold sentence stays natural and speakable; everything after it is \
+telegraphic:\n\
+- Cut all filler, keep all technical substance.\n\
+- Drop articles (a, an, the), filler words (just, really, basically, actually) and \
+pleasantries (sure, certainly, happy to help).\n\
+- No hedging. Fragments fine. Short synonyms (fix, not 'implement a solution for').\n\
+- Technical terms exact. Code blocks unchanged.\n\
+- Bullet pattern: [thing] [action] [reason].";
+const CAVEMAN_ES: &str = "\n\
+MODO CAVERNÍCOLA — la oración inicial en negrita queda natural y decible; todo lo que sigue, \
+telegráfico:\n\
+- Cortá todo el relleno, mantené toda la sustancia técnica.\n\
+- Sin muletillas (básicamente, realmente, simplemente) ni cortesías (claro, por supuesto, \
+encantado de ayudar).\n\
+- Sin matizar de más. Fragmentos OK. Sinónimos cortos (arreglá, no 'implementá una solución \
+para').\n\
+- Mantené los artículos solo cuando quitarlos vuelva ambigua la frase.\n\
+- Términos técnicos exactos. Bloques de código intactos.\n\
+- Patrón por bullet: [cosa] [acción] [razón].";
+
+fn caveman_suffix(language: Language) -> &'static str {
+    match language {
+        Language::English => CAVEMAN_EN,
+        Language::Spanish => CAVEMAN_ES,
+    }
+}
+
+/// `base` with the selected style applied: `Normal` borrows the prompt
+/// unchanged, `Caveman` appends the terseness addendum.
+fn styled_system(
+    base: &'static str,
+    language: Language,
+    style: ResponseStyle,
+) -> Cow<'static, str> {
+    match style {
+        ResponseStyle::Normal => Cow::Borrowed(base),
+        ResponseStyle::Caveman => Cow::Owned(format!("{base}{}", caveman_suffix(language))),
     }
 }
 
@@ -450,6 +501,35 @@ impl BrainModel {
     }
 }
 
+/// How answers are WORDED. Selected in the UI. `Normal` keeps the prompts
+/// exactly as they always were; `Caveman` appends the terseness addendum to
+/// both answer system prompts and asks gpt-5* for low verbosity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseStyle {
+    #[default]
+    Normal,
+    Caveman,
+}
+
+impl ResponseStyle {
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Caveman => "caveman",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "normal" => Some(Self::Normal),
+            "caveman" => Some(Self::Caveman),
+            _ => None,
+        }
+    }
+}
+
 pub struct ApiBackend {
     client: reqwest::Client,
     groq: Option<SecretString>,
@@ -500,17 +580,19 @@ impl ApiBackend {
 
     /// Ask the selected brain, cascading on pre-first-token failure. Streams
     /// `answer-delta` events. Errors only if EVERY candidate provider fails.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ask(
         &self,
         question: &str,
         context: &str,
         language: Language,
         brain: BrainModel,
+        style: ResponseStyle,
         trace_id: &str,
         app: &AppHandle,
     ) -> Result<ApiOutcome> {
         let prompt = build_user(question, context, language);
-        let system = system_prompt(language);
+        let system = styled_system(system_prompt(language), language, style);
         let mut last_err = anyhow!("no providers available (no API keys?)");
         for p in brain.providers() {
             let Some(key) = self.key_for(p.key_env) else {
@@ -518,7 +600,7 @@ impl ApiBackend {
                 continue;
             };
             match self
-                .try_provider(p, key, system, &prompt, trace_id, app)
+                .try_provider(p, key, &system, &prompt, style, trace_id, app)
                 .await
             {
                 Ok(outcome) => {
@@ -539,16 +621,23 @@ impl ApiBackend {
         Err(last_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_provider(
         &self,
         p: &Provider,
         key: &SecretString,
         system: &str,
         prompt: &str,
+        style: ResponseStyle,
         trace_id: &str,
         app: &AppHandle,
     ) -> Result<ApiOutcome> {
-        let body = chat_body(p.model, system, json!(prompt), 500, 0.4);
+        let mut body = chat_body(p.model, system, json!(prompt), 500, 0.4);
+        // Decoder-level brevity nudge; compounds with the caveman prompt.
+        // gpt-5* only — other providers reject the unknown parameter.
+        if style == ResponseStyle::Caveman && p.model.starts_with("gpt-5") {
+            body["verbosity"] = json!("low");
+        }
         let t0 = Instant::now();
         let resp = tokio::time::timeout(
             FIRST_TOKEN_TIMEOUT,
@@ -654,12 +743,14 @@ impl ApiBackend {
     /// streaming `answer-delta` events. `OpenAI`-only — the agent wants a strong
     /// model, so `Auto` (the speed-first auto-answer chain) resolves to gpt-5.5;
     /// a pinned gpt-4o-mini is honored.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ask_agent(
         &self,
         transcript: &str,
         state_block: &str,
         language: Language,
         brain: BrainModel,
+        style: ResponseStyle,
         trace_id: &str,
         app: &AppHandle,
     ) -> Result<AgentOutcome> {
@@ -671,12 +762,16 @@ impl ApiBackend {
             BrainModel::Gpt4oMini => "gpt-4o-mini",
             BrainModel::Auto | BrainModel::Gpt55 => "gpt-5.5",
         };
-        let body = agent_body(
+        let mut body = agent_body(
             model,
-            agent_system(language),
+            &styled_system(agent_system(language), language, style),
             transcript,
             &agent_tail(state_block, language),
         );
+        // Decoder-level brevity nudge; compounds with the caveman prompt.
+        if style == ResponseStyle::Caveman && model.starts_with("gpt-5") {
+            body["verbosity"] = json!("low");
+        }
         let t0 = Instant::now();
         let resp = tokio::time::timeout(
             AGENT_FIRST_TOKEN_TIMEOUT,

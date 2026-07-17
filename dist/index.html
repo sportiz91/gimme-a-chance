@@ -111,6 +111,7 @@
     #langSelect   { flex: 0 0 auto; max-width: 120px; }
     #visionSelect { flex: 0 0 auto; max-width: 160px; }
     #brainSelect  { flex: 0 0 auto; max-width: 190px; }
+    #styleSelect  { flex: 0 0 auto; max-width: 150px; }
     #simPreset    { flex: 0 0 auto; max-width: 150px; }
     .hidden { display: none; }
     .check-label {
@@ -404,6 +405,10 @@
         <option value="auto">🧠 Auto (Groq→OpenAI)</option>
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
+      </select>
+      <select id="styleSelect" title="Response wording: Normal, or telegraphic caveman-terse (the bold opening line stays speakable)">
+        <option value="normal">💬 Normal</option>
+        <option value="caveman">🪨 Cavernícola</option>
       </select>
       <button id="agentBtn" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space). Press again while one streams — answers stack.">🤖 Agent</button>
       <button id="addShotBtn" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
@@ -715,6 +720,23 @@
           document.getElementById('brainSelect').value = await invoke('get_brain_model');
         }
       } catch (e) { console.error('initBrainModel failed:', e); }
+    }
+    async function setResponseStyle() {
+      const style = document.getElementById('styleSelect').value;
+      localStorage.setItem('responseStyle', style);
+      try { await invoke('set_response_style', { style }); log('info', 'response_style_set', { style }); }
+      catch (e) { console.error('set_response_style failed:', e); }
+    }
+    async function initResponseStyle() {
+      const saved = localStorage.getItem('responseStyle');
+      try {
+        if (saved) {
+          document.getElementById('styleSelect').value = saved;
+          await invoke('set_response_style', { style: saved });
+        } else {
+          document.getElementById('styleSelect').value = await invoke('get_response_style');
+        }
+      } catch (e) { console.error('initResponseStyle failed:', e); }
     }
 
     // Screenshot queue: Ctrl+Shift+Enter stacks captures (scroll a long page
@@ -1205,6 +1227,7 @@
       on('listenBtn', 'click', toggleListening);
       on('visionSelect', 'change', setVisionModel);
       on('brainSelect', 'change', setBrainModel);
+      on('styleSelect', 'change', setResponseStyle);
       on('agentBtn', 'click', askAgent);
       on('addShotBtn', 'click', addShot);
       on('describeBtn', 'click', () => describeQueue());
@@ -1238,6 +1261,7 @@
     initLanguage();
     initVisionModel();
     initBrainModel();
+    initResponseStyle();
     initQueue();
     initAutoClip();
 

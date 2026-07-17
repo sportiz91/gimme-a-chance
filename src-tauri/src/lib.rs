@@ -99,6 +99,8 @@ pub struct AppState {
     pub vision_model: Arc<Mutex<backend::VisionModel>>,
     /// Brain model that answers (later: a wired-in agent). Toggled from the UI; default Auto.
     pub brain_model: Arc<Mutex<backend::BrainModel>>,
+    /// How answers are worded (normal vs caveman-terse). Toggled from the UI; default Normal.
+    pub response_style: Arc<Mutex<backend::ResponseStyle>>,
     /// Latest screen description (for the future agent + debug). Overwritten each capture.
     pub last_description: Arc<Mutex<String>>,
     /// Screenshots queued for a multi-shot describe (base64 JPEGs, in capture
@@ -135,6 +137,7 @@ impl Default for AppState {
             api: Arc::new(backend::ApiBackend::new()),
             vision_model: Arc::new(Mutex::new(backend::VisionModel::default())),
             brain_model: Arc::new(Mutex::new(backend::BrainModel::default())),
+            response_style: Arc::new(Mutex::new(backend::ResponseStyle::default())),
             last_description: Arc::new(Mutex::new(String::new())),
             capture_queue: Arc::new(Mutex::new(Vec::new())),
             auto_clip: Arc::new(AtomicBool::new(true)),
@@ -788,6 +791,8 @@ pub fn run() {
             commands::get_vision_model,
             commands::set_brain_model,
             commands::get_brain_model,
+            commands::set_response_style,
+            commands::get_response_style,
             commands::set_language,
             commands::get_language,
             commands::simulate_interviewer,

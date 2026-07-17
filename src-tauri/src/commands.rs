@@ -373,10 +373,15 @@ pub async fn ask_brain(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let style = state
+        .response_style
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
     let outcome = state
         .api
-        .ask(&question, &context, language, brain, &trace_id, &app)
+        .ask(&question, &context, language, brain, style, &trace_id, &app)
         .await
         .map_err(|e| AppError::Llm(e.to_string()))?;
     metrics
@@ -422,6 +427,11 @@ pub async fn ask_agent(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let style = state
+        .response_style
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
     let (transcript, transcript_lines) = state.agent.transcript_text();
     if transcript.is_empty() {
@@ -436,7 +446,15 @@ pub async fn ask_agent(
 
     let outcome = state
         .api
-        .ask_agent(&transcript, &state_block, language, brain, &trace_id, &app)
+        .ask_agent(
+            &transcript,
+            &state_block,
+            language,
+            brain,
+            style,
+            &trace_id,
+            &app,
+        )
         .await
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
@@ -857,6 +875,36 @@ pub fn get_brain_model(state: tauri::State<'_, AppState>) -> Result<String, AppE
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     Ok(m.tag().to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_response_style(
+    state: tauri::State<'_, AppState>,
+    style: String,
+) -> Result<(), AppError> {
+    let new_style = crate::backend::ResponseStyle::from_tag(&style)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown response style: {style}")))?;
+    let mut guard = state
+        .response_style
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    *guard = new_style;
+    tracing::info!(?new_style, "response style switched");
+    Ok(())
+}
+
+/// Current response style tag (for the UI to reflect on load).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn get_response_style(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let s = state
+        .response_style
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(s.tag().to_string())
 }
 
 /// Copy the current selection (synthetic Ctrl+C to the focused app) and ingest
