@@ -36,6 +36,15 @@ const MONO_SCRATCH_CAPACITY: usize = 48_000;
 // sits well above ~0.02; raise if noise still leaks, lower if quiet speech is dropped.
 const RMS_SILENCE_THRESHOLD: f32 = 0.01;
 
+// A chunk at least this long that decodes to EMPTY despite loud audio is a
+// truncation casualty, not silence: Canary (an AED model) collapses to empty
+// output on chunks force-cut mid-word by `vad::MAX_CHUNK_MS` (measured
+// 2026-07-20: 18s of real speech silently dropped in one session). Chunks
+// matching that signature are re-decoded with local whisper, which is robust
+// to abrupt cuts.
+#[cfg(feature = "sherpa")]
+const SUSPECT_EMPTY_MIN_MS: usize = 2_000;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceInfo {
     pub name: String,
@@ -516,6 +525,27 @@ pub async fn capture_and_transcribe(
                             .last_stt_ms
                             .store(elapsed_ms as u64, Ordering::Relaxed);
                         let trimmed = text.trim().to_string();
+                        // Loud + long + empty from the on-device engine = the
+                        // mid-word-cut collapse (see SUSPECT_EMPTY_MIN_MS),
+                        // not silence — retry before discarding speech.
+                        #[cfg(feature = "sherpa")]
+                        let trimmed = if trimmed.is_empty()
+                            && matches!(&engine, SttEngine::Parakeet(_))
+                            && chunk.len() * 1000 / WHISPER_SAMPLE_RATE as usize
+                                >= SUSPECT_EMPTY_MIN_MS
+                            && level >= RMS_SILENCE_THRESHOLD * 2.0
+                        {
+                            tracing::warn!(
+                                rms = level,
+                                chunk_ms = chunk.len() * 1000 / WHISPER_SAMPLE_RATE as usize,
+                                "on-device STT returned empty for a loud long chunk (mid-word cut?) — re-decoding with local whisper"
+                            );
+                            whisper
+                                .transcribe(&chunk)
+                                .map_or(trimmed, |t| t.trim().to_string())
+                        } else {
+                            trimmed
+                        };
                         if trimmed.is_empty() || is_whisper_non_speech_tag(&trimmed) {
                             tracing::debug!(
                                 text = %trimmed,
