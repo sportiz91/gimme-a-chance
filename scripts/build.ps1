@@ -1,8 +1,18 @@
 # build.ps1 — Build gimme-a-chance in release mode
 #
+# Builds with the `sherpa` feature by DEFAULT — the release exe is the
+# interview binary and must carry on-device STT (💻 Local / ⚡ parciales) + AEC3.
+# Run after every feature lands on main so the Desktop shortcut is never stale.
+#
 # Usage:
-#   .\scripts\build.ps1
+#   .\scripts\build.ps1               (full build: sherpa on-device STT/TTS)
+#   .\scripts\build.ps1 -CloudOnly    (skip sherpa — NOT for interviews)
 #   powershell.exe -ExecutionPolicy Bypass -File scripts\build.ps1
+
+[CmdletBinding()]
+param(
+    [switch]$CloudOnly
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -25,8 +35,13 @@ if ((Test-Path $cargoBin) -and ($env:PATH -notlike "*$cargoBin*")) {
 
 Set-Location $CargoDir
 
-Write-Host "`n=== Building release ===" -ForegroundColor Cyan
-cargo build --release
+if ($CloudOnly) {
+    Write-Host "`n=== Building release (cloud-only) ===" -ForegroundColor Cyan
+    cargo build --release
+} else {
+    Write-Host "`n=== Building release (--features sherpa) ===" -ForegroundColor Cyan
+    cargo build --release --features sherpa
+}
 
 if ($LASTEXITCODE -eq 0) {
     $exe = Join-Path $CargoDir "target\release\gimme-a-chance.exe"

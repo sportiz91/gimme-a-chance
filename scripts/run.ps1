@@ -16,5 +16,25 @@ if (-not (Test-Path $exe)) {
     exit 1
 }
 
+# Freshness guard: an exe older than the last commit means the interview binary
+# is missing features merged since it was built (the silent failure mode that
+# burned a real interview on 2026-07-17).
+Set-Location $RepoRoot
+$exeTime = (Get-Item $exe).LastWriteTimeUtc
+$headUnix = git log -1 --format=%ct 2>$null
+if ($headUnix) {
+    $headTime = [DateTimeOffset]::FromUnixTimeSeconds([int64]$headUnix).UtcDateTime
+    if ($exeTime -lt $headTime) {
+        Write-Host "WARN: exe ($($exeTime.ToString('yyyy-MM-dd HH:mm'))Z) is OLDER than the last commit ($($headTime.ToString('yyyy-MM-dd HH:mm'))Z)." -ForegroundColor Red
+        Write-Host "      Run scripts\build.ps1 before a real interview." -ForegroundColor Yellow
+    }
+}
+
+# The sherpa `shared` DLLs must sit next to the exe — without them the local
+# STT engine silently degrades to cloud.
+if (-not (Test-Path (Join-Path (Split-Path $exe) "sherpa-onnx-c-api.dll"))) {
+    Write-Host "WARN: sherpa DLLs missing next to the exe (cloud-only build?) — no on-device STT." -ForegroundColor Yellow
+}
+
 Write-Host "Starting gimme-a-chance..." -ForegroundColor Cyan
 & $exe

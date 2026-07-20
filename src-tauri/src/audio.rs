@@ -146,16 +146,16 @@ pub enum AecEnd {
 pub enum SttEngine {
     /// Groq cloud Whisper — default when a `GROQ_API_KEY` is present.
     Groq(std::sync::Arc<cloud_stt::GroqStt>),
-    /// On-device Parakeet via sherpa-onnx (`GIMME_STT_ENGINE=sherpa`).
+    /// On-device Parakeet via sherpa-onnx (UI: Local on, partials off).
     #[cfg(feature = "sherpa")]
     Parakeet(&'static crate::stt::ParakeetStt),
     /// On-device hybrid streaming via sherpa-onnx
-    /// (`GIMME_STT_ENGINE=streaming`): a light online model emits live partial
+    /// (UI: Local on, partials on): a light online model emits live partial
     /// hypotheses while the speaker talks; on endpoint the utterance audio is
     /// re-decoded with offline Parakeet for a high-quality final.
     #[cfg(feature = "sherpa")]
     Streaming(&'static crate::stt::StreamingStt),
-    /// Local whisper-rs only (`GIMME_STT_ENGINE=whisper`).
+    /// Local whisper-rs only (last-resort fallback: no Groq key, no models).
     LocalWhisper,
 }
 

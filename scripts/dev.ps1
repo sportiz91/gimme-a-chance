@@ -1,15 +1,20 @@
 # dev.ps1 — Run gimme-a-chance in live dev mode (cargo tauri dev)
 #
+# Builds with the `sherpa` feature by DEFAULT so the UI's 💻 local / ⚡ partials
+# switches (on-device STT) and AEC3 actually work. -CloudOnly skips it for a
+# faster pure-cloud build (the local switch then degrades to Groq with a warn).
+#
 # Usage:
-#   .\scripts\dev.ps1                           (no features)
-#   .\scripts\dev.ps1 -Features tracy           (Tracy profiler)
-#   .\scripts\dev.ps1 -Features flame           (flamegraph folded output)
+#   .\scripts\dev.ps1                           (full build: sherpa on-device STT/TTS)
+#   .\scripts\dev.ps1 -CloudOnly                (skip sherpa — faster compile, cloud STT only)
+#   .\scripts\dev.ps1 -Features tracy           (extra features appended: tracy, flame)
 #   .\scripts\dev.ps1 -Features tracy,flame     (both at once)
 #   powershell.exe -ExecutionPolicy Bypass -File scripts\dev.ps1 -Features tracy
 
 [CmdletBinding()]
 param(
-    [string]$Features
+    [string]$Features,
+    [switch]$CloudOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,9 +61,14 @@ if (-not $env:RUST_LOG) {
     $env:RUST_LOG = "info,gimme_a_chance_lib=debug"
 }
 
-if ($Features) {
-    Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG, features=$Features)..." -ForegroundColor Cyan
-    cargo tauri dev --features $Features
+$featureList = @()
+if (-not $CloudOnly) { $featureList += 'sherpa' }
+if ($Features) { $featureList += ($Features -split ',') }
+
+if ($featureList.Count -gt 0) {
+    $feat = $featureList -join ','
+    Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG, features=$feat)..." -ForegroundColor Cyan
+    cargo tauri dev --features $feat
 } else {
     Write-Host "Starting cargo tauri dev (RUST_LOG=$env:RUST_LOG)..." -ForegroundColor Cyan
     cargo tauri dev

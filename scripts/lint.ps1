@@ -41,4 +41,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "OK" -ForegroundColor Green
 
+# Second pass with `sherpa`: the dev/release default build carries it, and the
+# gated code (on-device STT, AEC3) never gets linted by the plain pass above.
+Write-Host "`n=== cargo clippy (--features sherpa) ===" -ForegroundColor Cyan
+cargo clippy --all-targets --features sherpa --manifest-path $Manifest -- -D warnings
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nClippy found warnings in the sherpa build. Fix them before committing." -ForegroundColor Red
+    exit 1
+}
+Write-Host "OK" -ForegroundColor Green
+
 Write-Host "`n=== All checks passed ===" -ForegroundColor Green

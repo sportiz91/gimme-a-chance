@@ -57,12 +57,22 @@ Frontend communicates with Rust via Tauri IPC (invoke/listen).
 
 ## The `sherpa` Feature (on-device STT/TTS)
 
-- Dev loop: `.\scripts\dev-sherpa.ps1` (defaults to the hybrid streaming engine;
-  `-Engine sherpa` for chunked Parakeet).
-- STT engine selection (`commands.rs`): `GIMME_STT_ENGINE` = `streaming` (hybrid:
-  FastConformer live partials + Parakeet finals — the production engine) |
-  `sherpa` (Parakeet per VAD chunk) | `whisper` (force local whisper) | unset
-  (Groq cloud). Local whisper is always the grace fallback.
+- Dev loop: `.\scripts\dev.ps1` builds with `sherpa` by DEFAULT (`-CloudOnly`
+  skips it for a faster pure-cloud compile).
+- STT engine selection (`commands.rs::start_listening`) is driven from the UI
+  (segmented ☁️ Nube / 💻 Local control + ⚡ parciales checkbox, persisted in
+  localStorage, pushed via the `set_stt_config` command; read once per Listen).
+  Flipping either control — or the language selector — mid-session
+  auto-restarts the live Listen from JS (stop → 600ms drain → start; the old
+  pipelines share `is_listening` with the new ones, hence the pause) so it
+  applies immediately. No env var involved:
+  - Local OFF (default) → Groq cloud (`whisper-large-v3-turbo`).
+  - Local ON + partials ON → hybrid streaming (FastConformer/Kroko live
+    partials + Parakeet/Canary finals — the production interview engine).
+  - Local ON + partials OFF → Parakeet/Canary per VAD chunk (no zipformer).
+  - Cloud with no `GROQ_API_KEY` falls back to Parakeet/Canary (if built +
+    fetched), then local whisper. Mid-session request failures still fall back
+    to local whisper (always loaded — never a model load on the hot path).
 - Hybrid design (`audio.rs::streaming_loop`): a light online model only powers
   ephemeral `transcription-partial` events; on endpoint the buffered utterance is
   re-decoded with offline Parakeet for the final (~100ms per second of audio).

@@ -78,16 +78,20 @@ pub async fn start_listening(
         w
     };
 
-    // STT engine: GIMME_STT_ENGINE = "whisper" (force local) | "sherpa"
-    // (on-device Parakeet, per chunk) | "streaming" (on-device hybrid with
-    // live partials) | unset → Groq cloud. The on-device engines need
-    // --features sherpa + fetched models. All resolve the model set for `language`.
-    let stt_pref = std::env::var("GIMME_STT_ENGINE").unwrap_or_default();
-    let engine = match stt_pref.as_str() {
-        "whisper" => audio::SttEngine::LocalWhisper,
-        "sherpa" | "parakeet" => sherpa_engine_or_default(language),
-        "streaming" | "online" => streaming_engine_or_default(language),
-        _ => default_stt_engine(language),
+    // STT engine per the UI switches (`set_stt_config`): Local off → Groq
+    // cloud chain; Local on → on-device finals (Parakeet EN / Canary ES), plus
+    // the light streaming model for live partials when that switch is on. The
+    // local paths degrade to the cloud chain with a warn if this build lacks
+    // the `sherpa` feature or the models aren't fetched. All resolve the model
+    // set for `language`.
+    let engine = if state.stt_local.load(Ordering::Relaxed) {
+        if state.stt_partials.load(Ordering::Relaxed) {
+            streaming_engine_or_default(language)
+        } else {
+            sherpa_engine_or_default(language)
+        }
+    } else {
+        default_stt_engine(language)
     };
 
     // "both" → dual capture: loopback (interviewer) + mic (you), both transcribed
@@ -153,34 +157,42 @@ pub async fn start_listening(
     Ok(())
 }
 
-/// Default chain: Groq cloud Whisper when a key is present, else local whisper.
+/// Default chain: Groq cloud Whisper when a key is present; else on-device
+/// Parakeet/Canary when this build carries them and the models load; else the
+/// local whisper fallback. Every step is a degraded mode, never an error
+/// mid-interview — and whisper `base` is the weakest link, so it goes last.
 fn default_stt_engine(language: crate::lang::Language) -> audio::SttEngine {
-    crate::cloud_stt::GroqStt::new(language)
-        .map(Arc::new)
-        .map_or(audio::SttEngine::LocalWhisper, audio::SttEngine::Groq)
+    if let Some(g) = crate::cloud_stt::GroqStt::new(language) {
+        return audio::SttEngine::Groq(Arc::new(g));
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(p) = crate::stt::parakeet(language) {
+        tracing::warn!("no GROQ_API_KEY — using on-device Parakeet/Canary instead of cloud STT");
+        return audio::SttEngine::Parakeet(p);
+    }
+    tracing::warn!("no GROQ_API_KEY and no on-device models — falling back to local whisper");
+    audio::SttEngine::LocalWhisper
 }
 
-/// `GIMME_STT_ENGINE=sherpa`: on-device Parakeet (for `language`) if this build
-/// carries the `sherpa` feature and the models are fetched; otherwise warn and use
-/// the default chain rather than dying mid-setup.
+/// Local finals without partials: on-device Parakeet/Canary (for `language`)
+/// if this build carries the `sherpa` feature and the models are fetched;
+/// otherwise warn and use the default chain rather than dying mid-setup.
 fn sherpa_engine_or_default(language: crate::lang::Language) -> audio::SttEngine {
     #[cfg(feature = "sherpa")]
     {
         if let Some(p) = crate::stt::parakeet(language) {
             return audio::SttEngine::Parakeet(p);
         }
-        tracing::warn!(
-            "GIMME_STT_ENGINE=sherpa but Parakeet could not load; using default STT engine"
-        );
+        tracing::warn!("local STT selected but Parakeet could not load; using default STT engine");
     }
     #[cfg(not(feature = "sherpa"))]
     tracing::warn!(
-        "GIMME_STT_ENGINE=sherpa but this build lacks the `sherpa` feature; using default STT engine"
+        "local STT selected but this build lacks the `sherpa` feature; using default STT engine"
     );
     default_stt_engine(language)
 }
 
-/// `GIMME_STT_ENGINE=streaming`: hybrid on-device engine for `language` — live
+/// Local finals + live partials: hybrid on-device engine for `language` —
 /// partials from the light online model, finals re-decoded with Parakeet; same
 /// degrade-to-default contract as the Parakeet path.
 fn streaming_engine_or_default(language: crate::lang::Language) -> audio::SttEngine {
@@ -198,12 +210,12 @@ fn streaming_engine_or_default(language: crate::lang::Language) -> audio::SttEng
             return audio::SttEngine::Streaming(s);
         }
         tracing::warn!(
-            "GIMME_STT_ENGINE=streaming but the streaming model could not load; using default STT engine"
+            "partials selected but the streaming model could not load; using default STT engine"
         );
     }
     #[cfg(not(feature = "sherpa"))]
     tracing::warn!(
-        "GIMME_STT_ENGINE=streaming but this build lacks the `sherpa` feature; using default STT engine"
+        "partials selected but this build lacks the `sherpa` feature; using default STT engine"
     );
     default_stt_engine(language)
 }
@@ -244,27 +256,25 @@ fn warm_stt_models(app: tauri::AppHandle, state: &AppState, language: crate::lan
         crate::lang::Language::English => Arc::clone(&state.whisper),
         crate::lang::Language::Spanish => Arc::clone(&state.whisper_es),
     };
+    let local = state.stt_local.load(Ordering::Relaxed);
+    let partials = state.stt_partials.load(Ordering::Relaxed);
     std::thread::spawn(move || {
         app.emit("stt-warmup", WarmupPayload { state: "started" })
             .ok();
         let t0 = std::time::Instant::now();
 
-        // On-device engines — with GIMME_STT_ENGINE=streaming these are what
-        // the first Listen actually waits on.
-        let stt_pref = std::env::var("GIMME_STT_ENGINE").unwrap_or_default();
+        // On-device engines — with the Local switch on these are what the
+        // first Listen actually waits on (partials add the light streaming
+        // model on top of the Parakeet/Canary finals).
         #[cfg(feature = "sherpa")]
-        match stt_pref.as_str() {
-            "sherpa" | "parakeet" => {
-                let _ = crate::stt::parakeet(language);
-            }
-            "streaming" | "online" => {
+        if local {
+            if partials {
                 let _ = crate::stt::streaming(language);
-                let _ = crate::stt::parakeet(language);
             }
-            _ => {}
+            let _ = crate::stt::parakeet(language);
         }
         #[cfg(not(feature = "sherpa"))]
-        drop(stt_pref);
+        let _ = (local, partials);
 
         // Local whisper fallback for this language. English is preloaded at
         // startup already; Spanish builds here on the first Spanish session.
@@ -618,6 +628,35 @@ pub fn get_language(state: tauri::State<'_, AppState>) -> Result<String, AppErro
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     Ok(language.tag().to_string())
+}
+
+/// UI switches for STT: `local` = on-device inference (Parakeet/Canary
+/// finals), `partials` = live gray-line hypotheses from the light streaming
+/// model (only meaningful with `local` on). Read at `start_listening` time
+/// like `language`, so flipping a switch takes effect on the next Listen.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state, app))]
+pub fn set_stt_config(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    local: bool,
+    partials: bool,
+) -> Result<(), AppError> {
+    state.stt_local.store(local, Ordering::Relaxed);
+    state.stt_partials.store(partials, Ordering::Relaxed);
+    tracing::info!(local, partials, "stt config set");
+    if local {
+        // Warm the on-device models in the background so the next Listen is
+        // instant instead of paying multi-second model loads.
+        let language = state
+            .language
+            .lock()
+            .map(|g| *g)
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        warm_stt_models(app, &state, language);
+    }
+    Ok(())
 }
 
 /// Cap on queued screenshots. Ten covers a very long page; past that the user

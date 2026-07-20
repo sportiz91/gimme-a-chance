@@ -127,6 +127,15 @@ pub struct AppState {
     /// The local Spanish whisper model (multilingual `base`), loaded lazily on the
     /// first Spanish Listen so English users never pay for it.
     pub whisper_es: Arc<OnceLock<Arc<transcriber::WhisperTranscriber>>>,
+    /// STT inference location. `false` (default) = Groq cloud chain; `true` =
+    /// on-device finals (Parakeet EN / Canary ES — needs the `sherpa` feature +
+    /// fetched models, degrades to cloud with a warn otherwise). Toggled from
+    /// the UI; read at `start_listening` time like `language`.
+    pub stt_local: Arc<AtomicBool>,
+    /// Live partial hypotheses (the light streaming model feeding the gray
+    /// line). Only meaningful while `stt_local` is on: partials on = hybrid
+    /// streaming engine, off = Parakeet per VAD chunk (no zipformer running).
+    pub stt_partials: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -148,6 +157,8 @@ impl Default for AppState {
             tts: Arc::new(tts::TtsEngine::new()),
             whisper: Arc::new(OnceLock::new()),
             whisper_es: Arc::new(OnceLock::new()),
+            stt_local: Arc::new(AtomicBool::new(false)),
+            stt_partials: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -816,6 +827,7 @@ pub fn run() {
             commands::get_response_style,
             commands::set_language,
             commands::get_language,
+            commands::set_stt_config,
             commands::simulate_interviewer,
             commands::log_from_frontend,
             commands::open_answer_window,

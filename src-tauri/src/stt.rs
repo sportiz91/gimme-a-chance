@@ -5,9 +5,9 @@
 //! Three engines live here:
 //!
 //! - **`ParakeetStt`** — offline `NeMo` Parakeet TDT, decodes one VAD chunk at a
-//!   time (`GIMME_STT_ENGINE=sherpa`). Most accurate, ~200ms per chunk.
+//!   time (UI: Local on, partials off). Most accurate, ~200ms per chunk.
 //! - **`StreamingStt`** — light online model with endpoint detection
-//!   (`GIMME_STT_ENGINE=streaming`). Powers live partial hypotheses ONLY; on
+//!   (UI: Local on, partials on). Powers live partial hypotheses ONLY; on
 //!   endpoint the audio loop re-decodes the utterance with `ParakeetStt`, so
 //!   finals get Parakeet quality. A heavier online model (Nemotron 0.6b) was
 //!   tried here and saturated the CPU with dual capture — partials lagged

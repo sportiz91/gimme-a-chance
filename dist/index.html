@@ -72,6 +72,9 @@
       display: flex;
       gap: 8px;
       align-items: center;
+      /* The Listen row gained the local/partials switches — wrap instead of
+         overflowing the fixed-width window when device names run long. */
+      flex-wrap: wrap;
     }
 
     button {
@@ -123,6 +126,8 @@
     #visionSelect { flex: 0 0 auto; max-width: 160px; }
     #brainSelect  { flex: 0 0 auto; max-width: 190px; }
     #styleSelect  { flex: 0 0 auto; max-width: 150px; }
+    /* Grayed while the partials switch is inert (cloud STT selected) */
+    .check-label:has(input:disabled) { opacity: 0.45; }
     #simPreset    { flex: 0 0 auto; max-width: 150px; }
     .hidden { display: none; }
     .check-label {
@@ -133,6 +138,30 @@
       opacity: 0.7;
       white-space: nowrap;
     }
+    /* Segmented Nube/Local switch — two radios styled as one pill */
+    .seg {
+      display: flex;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      overflow: hidden;
+      flex: 0 0 auto;
+      font-size: 11px;
+    }
+    .seg input { position: absolute; opacity: 0; pointer-events: none; }
+    .seg span {
+      display: block;
+      padding: 4px 8px;
+      opacity: 0.55;
+      white-space: nowrap;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .seg input:checked + span {
+      background: rgba(255,255,255,0.12);
+      opacity: 1;
+    }
+    /* Inert while an auto-restart of the Listen is in flight */
+    .seg.disabled { opacity: 0.45; pointer-events: none; }
 
     /* Status indicator */
     .status {
@@ -406,6 +435,17 @@
         <option value="english">English</option>
         <option value="spanish">Español</option>
       </select>
+      <div class="seg" id="sttModeSeg" title="Dónde corre la transcripción">
+        <label title="Inferencia en la nube: Groq (whisper-large-v3-turbo). El audio sale de la máquina; si no hay key cae a modelos locales">
+          <input type="radio" name="sttMode" value="cloud" checked><span>☁️ Nube</span>
+        </label>
+        <label title="Inferencia local: Parakeet (EN) / Canary (ES) en tu máquina. El audio nunca sale; habilita los parciales">
+          <input type="radio" name="sttMode" value="local"><span>💻 Local</span>
+        </label>
+      </div>
+      <label class="check-label" title="Parciales en vivo: línea gris con la hipótesis mientras se habla (solo con inferencia Local)">
+        <input type="checkbox" id="partialsChk" checked> ⚡ parciales
+      </label>
       <button id="listenBtn">Listen</button>
     </div>
 
@@ -683,7 +723,11 @@
         log('info', 'language_set', { language });
       } catch (e) {
         console.error('set_language failed:', e);
+        return;
       }
+      // Models are per-language — restart a live Listen so the new language's
+      // engine applies now instead of on the next Listen.
+      await restartListeningIfLive('language_restart', { language });
     }
 
     // Restore the persisted language, reflect it in the dropdown, and push it to
@@ -696,6 +740,57 @@
       } catch (e) {
         console.error('set_language (init) failed:', e);
       }
+    }
+
+    async function setSttConfig() {
+      const local = document.querySelector('input[name="sttMode"]:checked').value === 'local';
+      const partials = document.getElementById('partialsChk').checked;
+      // Partials only exist on the local engine — gray the switch out on cloud.
+      const chk = document.getElementById('partialsChk');
+      chk.disabled = !local;
+      localStorage.setItem('sttLocal', local);
+      localStorage.setItem('sttPartials', partials);
+      try {
+        await invoke('set_stt_config', { local, partials });
+        log('info', 'stt_config_set', { local, partials });
+      } catch (e) {
+        console.error('set_stt_config failed:', e);
+        return;
+      }
+      await restartListeningIfLive('stt_config_restart', { local, partials });
+    }
+
+    // Engine and models are resolved once per Listen, so a config flip
+    // mid-session would only apply to the NEXT Listen — restart the live one
+    // instead: stop, give the old pipelines time to observe the flag and wind
+    // down (they share is_listening with the new ones), start. Shared by the
+    // STT switches and the language selector.
+    async function restartListeningIfLive(event, data) {
+      if (!isListening || document.getElementById('listenBtn').disabled) return;
+      const seg = document.getElementById('sttModeSeg');
+      const chk = document.getElementById('partialsChk');
+      const chkWas = chk.disabled;
+      seg.classList.add('disabled');
+      chk.disabled = true;
+      try {
+        await toggleListening();                       // stop
+        await new Promise((r) => setTimeout(r, 600));  // drain old pipelines
+        await toggleListening();                       // start on the new config
+        log('info', event, data);
+      } finally {
+        seg.classList.remove('disabled');
+        chk.disabled = chkWas;
+      }
+    }
+
+    // Restore the persisted STT switches (defaults: cloud, partials on) and
+    // push them to the backend so both sides agree before the first Listen.
+    function initSttConfig() {
+      const local = localStorage.getItem('sttLocal') === 'true';
+      document.querySelector('input[name="sttMode"][value="' + (local ? 'local' : 'cloud') + '"]').checked = true;
+      const savedPartials = localStorage.getItem('sttPartials');
+      document.getElementById('partialsChk').checked = savedPartials === null || savedPartials === 'true';
+      setSttConfig();
     }
 
     // Vision & brain model selection (mirrors setLanguage / initLanguage).
@@ -1259,6 +1354,8 @@
       const on = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
       on('sourceSelect', 'change', loadDevices);
       on('langSelect', 'change', setLanguage);
+      document.querySelectorAll('input[name="sttMode"]').forEach((r) => r.addEventListener('change', setSttConfig));
+      on('partialsChk', 'change', setSttConfig);
       on('listenBtn', 'click', toggleListening);
       on('visionSelect', 'change', setVisionModel);
       on('brainSelect', 'change', setBrainModel);
@@ -1294,6 +1391,7 @@
     }
     loadDevices();
     initLanguage();
+    initSttConfig();
     initVisionModel();
     initBrainModel();
     initResponseStyle();

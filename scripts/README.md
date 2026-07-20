@@ -13,10 +13,10 @@ Utility scripts for building, running, linting, and testing **gimme-a-chance**.
 
 | Script | What it does |
 |---|---|
-| `dev.ps1` | `cargo tauri dev` — live dev mode |
+| `dev.ps1` | `cargo tauri dev --features sherpa` — live dev mode, full build (`-CloudOnly` skips sherpa) |
 | `build.ps1` | `cargo build --release` — optimized binary |
 | `run.ps1` | Run the release binary (requires `build.ps1` first) |
-| `lint.ps1` | `cargo fmt` + `cargo clippy -D warnings` — matches CI |
+| `lint.ps1` | `cargo fmt` + `cargo clippy -D warnings` (plain + `--features sherpa`) |
 | `test.ps1` | `cargo test` |
 
 Run from the repo root:
