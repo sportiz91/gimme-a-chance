@@ -21,7 +21,9 @@ if (-not (Test-Path $exe)) {
 # burned a real interview on 2026-07-17).
 Set-Location $RepoRoot
 $exeTime = (Get-Item $exe).LastWriteTimeUtc
-$headUnix = git log -1 --format=%ct 2>$null
+# Only commits that touch the binary's inputs count — docs/scripts commits
+# must not cry wolf, or the warning trains you to ignore it.
+$headUnix = git log -1 --format=%ct -- src-tauri dist 2>$null
 if ($headUnix) {
     $headTime = [DateTimeOffset]::FromUnixTimeSeconds([int64]$headUnix).UtcDateTime
     if ($exeTime -lt $headTime) {
