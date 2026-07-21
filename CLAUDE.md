@@ -7,8 +7,8 @@ Real-time interview copilot. Tauri v2 (Rust backend) + vanilla HTML/JS frontend.
 ## Repo Layout
 
 - `src-tauri/` — Rust backend (Cargo project)
-- `dist/` — Frontend (single index.html, no build step)
-- `scripts/` — Setup scripts for Ubuntu 24.04
+- `dist/` — Frontend (plain HTML/JS, no build step; index + answer pop-out + manager)
+- `scripts/` — Windows PowerShell helpers: dev/build/run/lint/test + model fetcher (see `scripts/README.md`)
 
 ## Build (Windows)
 
@@ -35,9 +35,9 @@ cargo build
 
 ## Key Dependencies
 
-- `whisper-rs 0.16` — STT (whisper.cpp bindings)
-- `sherpa-rs 0.6` (optional, feature `sherpa`) — on-device Parakeet STT + Kokoro TTS
-- `cpal 0.15` — audio capture
+- `whisper-rs 0.16` — local whisper.cpp STT (last-resort fallback)
+- `sherpa-onnx 1.13` (optional, feature `sherpa`, official k2-fsa bindings) — on-device STT (Parakeet/Canary finals, streaming partials) + Kokoro TTS; prebuilt `shared` DLLs
+- `cpal 0.15` — audio capture (WASAPI mic + loopback)
 - `tauri 2` — desktop framework
 - `tokio` — async runtime
 - `anyhow` — error handling
@@ -45,12 +45,19 @@ cargo build
 ## Architecture
 
 ```
-main.rs → lib.rs → audio.rs      (mic capture + transcription loop)
-                  → claude.rs     (Claude CLI integration)
-                  → transcriber.rs (Whisper model loading + inference)
-                  → cloud_stt.rs  (Groq Whisper cloud STT)
-                  → stt.rs        (sherpa-onnx: Parakeet STT + Kokoro TTS, feature `sherpa`)
-                  → tts.rs        (simulate-interviewer TTS: Kokoro → OpenAI fallback)
+main.rs → lib.rs → audio.rs        (capture pipelines: VAD chunking / streaming loop, AEC plumbing)
+                  → stt.rs          (sherpa-onnx: Parakeet/Canary finals, streaming partials, Kokoro TTS — feature `sherpa`)
+                  → cloud_stt.rs    (Groq Whisper cloud STT)
+                  → transcriber.rs  (local whisper.cpp fallback)
+                  → aec.rs/dtln.rs  (echo cancellation: AEC3 default, DTLN experimental)
+                  → backend.rs      (OpenAI/Groq chat: answers, vision, agent, state refresh)
+                  → agent.rs        (rolling interview transcript + Interview State doc)
+                  → commands.rs     (Tauri commands: listen, ask, describe, manager, STT config)
+                  → storage.rs      (SQLite session persistence via writer thread)
+                  → capture.rs/clipboard.rs (screen capture + clipboard ingestion)
+                  → telemetry.rs/metrics.rs/latency.rs/crashlog.rs (JSONL logs, gauges, panic dumps)
+                  → context_meter.rs (o200k token estimate anchored by API usage)
+                  → tts.rs          (simulate-interviewer TTS: Kokoro → OpenAI fallback)
 ```
 
 Frontend communicates with Rust via Tauri IPC (invoke/listen).
