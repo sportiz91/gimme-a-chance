@@ -34,6 +34,10 @@ const REFRESH_DELTA_CHARS: u64 = 10_000;
 const STALE_AFTER_SECS: u64 = 300;
 /// Skip refreshing over a trickle — a couple of exchanged lines.
 const MIN_DELTA_CHARS: u64 = 1_200;
+/// Defensive clamp on the Interview State document. The prompt asks the
+/// refresher for ~600 words, but the doc rides in EVERY press's volatile
+/// tail — a runaway model must not grow it unbounded.
+const STATE_MAX_CHARS: usize = 8_000;
 
 /// One transcript entry. `t_s` is seconds since the session started — an
 /// interview-relative clock the model can use ("at 12:30 you said…") that
@@ -187,7 +191,19 @@ impl AgentSession {
         Some((self.state_block(), delta, upto, delta_chars))
     }
 
-    fn commit_state(&self, new_state: String, covered_upto: u64) {
+    fn commit_state(&self, mut new_state: String, covered_upto: u64) {
+        if new_state.len() > STATE_MAX_CHARS {
+            let cut = (0..=STATE_MAX_CHARS)
+                .rev()
+                .find(|i| new_state.is_char_boundary(*i))
+                .unwrap_or(0);
+            tracing::warn!(
+                chars = new_state.len(),
+                clamped_to = cut,
+                "state doc over budget — clamped"
+            );
+            new_state.truncate(cut);
+        }
         if let Ok(mut s) = self.state_block.lock() {
             *s = new_state;
         }
@@ -242,6 +258,11 @@ pub fn push_line_tagged(app: &AppHandle, speaker: &'static str, kind: &'static s
         .metrics
         .transcript_lines
         .fetch_add(1, Ordering::Relaxed);
+    // A landed interviewer final is the wake-up for any deferred agent press
+    // (the press waits on this when the question was still being spoken).
+    if kind == "transcript" && speaker == "interviewer" {
+        state.interviewer_final.notify_waiters();
+    }
     if due {
         spawn_refresh(app);
     }

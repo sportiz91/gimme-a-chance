@@ -6,7 +6,7 @@
     clippy::let_underscore_must_use,
     clippy::too_many_lines
 )]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,7 +18,7 @@ use ringbuf::{
     HeapRb,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::cloud_stt;
 use crate::latency;
@@ -49,6 +49,87 @@ const SUSPECT_EMPTY_MIN_MS: usize = 2_000;
 pub struct DeviceInfo {
     pub name: String,
     pub is_default: bool,
+}
+
+/// Liveness token for one capture pipeline. Every `start_listening` AND
+/// `stop_listening` bumps the shared generation counter; a pipeline is alive
+/// only while the shared flag is up AND the generation it was born under is
+/// still current. The generation check is what kills zombies: a pipeline
+/// blocked in a long decode (Canary offline pass, a Groq round-trip) across a
+/// restart's stop→600ms→start window never observes the flag's brief `false`,
+/// but its generation is stale forever — so it exits at the next check, and
+/// the final it was decoding is discarded instead of pushed as a duplicate.
+#[derive(Clone)]
+pub struct ListenToken {
+    flag: Arc<Mutex<bool>>,
+    generation: Arc<AtomicU64>,
+    my_gen: u64,
+}
+
+impl ListenToken {
+    #[must_use]
+    pub fn new(flag: Arc<Mutex<bool>>, generation: Arc<AtomicU64>, my_gen: u64) -> Self {
+        Self {
+            flag,
+            generation,
+            my_gen,
+        }
+    }
+
+    /// Is this pipeline still the live one (flag up, generation current)?
+    fn alive(&self) -> bool {
+        *self
+            .flag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && self.generation.load(Ordering::SeqCst) == self.my_gen
+    }
+}
+
+/// Latest in-flight partial hypothesis per speaker (streaming engine only).
+/// The transcript store carries FINALS only; this slot is how the agent press
+/// sees a question the interviewer is still speaking. Entries are timestamped
+/// and readers ignore anything older than a couple of seconds — by then the
+/// endpoint fired and the final superseded it.
+#[derive(Clone, Default)]
+pub struct LivePartials {
+    inner: Arc<Mutex<std::collections::HashMap<&'static str, (String, Instant)>>>,
+}
+
+impl LivePartials {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<&'static str, (String, Instant)>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // `set`/`clear` are only called by the sherpa streaming loop — the chunked
+    // engines have no partials to publish.
+    #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+    fn set(&self, speaker: &'static str, text: &str) {
+        self.lock()
+            .insert(speaker, (text.to_string(), Instant::now()));
+    }
+
+    #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+    fn clear(&self, speaker: &str) {
+        self.lock().remove(speaker);
+    }
+
+    pub fn clear_all(&self) {
+        self.lock().clear();
+    }
+
+    /// The speaker's partial, if it is fresh enough to still be in flight.
+    #[must_use]
+    pub fn fresh(&self, speaker: &str, max_age: std::time::Duration) -> Option<String> {
+        self.lock()
+            .get(speaker)
+            .filter(|(text, at)| !text.is_empty() && at.elapsed() <= max_age)
+            .map(|(text, _)| text.clone())
+    }
 }
 
 /// Cross-pipeline acoustic-bleed filter for dual ("both") capture.
@@ -314,10 +395,10 @@ fn to_mono_into(samples: &[f32], channels: u16, out: &mut Vec<f32>) {
 
 /// Main audio capture + transcription loop
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(app, is_listening, metrics, whisper, engine, language, bleed, aec), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker, lang = language.tag()))]
+#[tracing::instrument(skip(app, token, metrics, whisper, engine, language, bleed, aec), fields(device = device_name.as_deref().unwrap_or("default"), source = ?source, speaker, lang = language.tag()))]
 pub async fn capture_and_transcribe(
     app: AppHandle,
-    is_listening: Arc<Mutex<bool>>,
+    token: ListenToken,
     metrics: Arc<Metrics>,
     device_name: Option<String>,
     source: CaptureSource,
@@ -428,14 +509,22 @@ pub async fn capture_and_transcribe(
         "capture pipeline started"
     );
 
+    // Shared press-timing signal (see `AppState`): the interviewer pipeline
+    // reports "inside an utterance" so an agent press can defer to the final
+    // about to land. Arc cloned out of state — no borrow held across the loops.
+    let speaking = Arc::clone(&app.state::<crate::AppState>().interviewer_speaking);
+
     // Streaming engine: continuous decode with partial hypotheses — a different
     // loop shape (no VAD batching), so it takes its own branch and shares the
     // cleanup tail below via early return.
     #[cfg(feature = "sherpa")]
     if let SttEngine::Streaming(stt) = &engine {
+        // The live-partial slot: how a half-spoken question reaches the agent
+        // press's prompt (streaming engine only — chunked paths have no partials).
+        let partials = app.state::<crate::AppState>().live_partials.clone();
         streaming_loop(
             &app,
-            &is_listening,
+            &token,
             &metrics,
             speaker,
             language,
@@ -444,6 +533,8 @@ pub async fn capture_and_transcribe(
             sample_rate,
             bleed.as_ref(),
             aec,
+            &speaking,
+            &partials,
         )
         .await;
         drop(stream);
@@ -459,10 +550,7 @@ pub async fn capture_and_transcribe(
     let mut pending: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 4);
 
     loop {
-        if !*is_listening
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
+        if !token.alive() {
             break;
         }
 
@@ -553,6 +641,14 @@ pub async fn capture_and_transcribe(
                                 chunk_ms = chunk.len() * 1000 / WHISPER_SAMPLE_RATE as usize,
                                 "discarded non-speech chunk"
                             );
+                        } else if !token.alive() {
+                            // Decoded across a Listen restart — this pipeline
+                            // is a zombie and a successor owns the stream now.
+                            tracing::info!(
+                                speaker,
+                                text = %trimmed,
+                                "discarded final from a stale pipeline (superseded by a Listen restart)"
+                            );
                         } else {
                             let trace_id = uuid::Uuid::new_v4().to_string();
                             tracing::info!(
@@ -576,6 +672,12 @@ pub async fn capture_and_transcribe(
                     Err(e) => tracing::warn!(error = %e, "transcription failed"),
                 }
             }
+        }
+
+        // Defer-to-final signal (chunked engines have no partials): true while
+        // the interviewer's words sit in a not-yet-flushed VAD chunk.
+        if speaker == "interviewer" && token.alive() {
+            speaking.store(chunker.in_speech(), Ordering::Relaxed);
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
@@ -603,7 +705,7 @@ pub async fn capture_and_transcribe(
 #[allow(clippy::too_many_arguments)]
 async fn streaming_loop<C: Consumer<Item = f32>>(
     app: &AppHandle,
-    is_listening: &Arc<Mutex<bool>>,
+    token: &ListenToken,
     metrics: &Arc<Metrics>,
     speaker: &'static str,
     language: crate::lang::Language,
@@ -612,6 +714,8 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
     sample_rate: u32,
     bleed: Option<&BleedWindow>,
     aec: Option<AecEnd>,
+    speaking: &Arc<AtomicBool>,
+    partials: &LivePartials,
 ) {
     // Cap on the buffered utterance audio re-decoded by Parakeet on endpoint.
     const UTTERANCE_CAP: usize = WHISPER_SAMPLE_RATE as usize * 60;
@@ -682,10 +786,7 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
     let mut speculative: Option<tokio::task::JoinHandle<Option<String>>> = None;
 
     loop {
-        if !*is_listening
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
+        if !token.alive() {
             break;
         }
 
@@ -827,6 +928,14 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
                         text = %final_text,
                         "discarded mic final as interviewer bleed"
                     );
+                } else if !token.alive() {
+                    // Decoded across a Listen restart — this pipeline is a
+                    // zombie and a successor owns the stream now.
+                    tracing::info!(
+                        speaker,
+                        text = %final_text,
+                        "discarded final from a stale pipeline (superseded by a Listen restart)"
+                    );
                 } else {
                     // The interviewer's words feed the bleed window (so the mic
                     // pipeline can recognize their echo).
@@ -873,12 +982,20 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
             carry_len = utterance.len();
             utterance_peak_rms = rms(&utterance);
             speculative = None;
-            // Clear the partial line in the UI — the final (if any) replaced it.
-            app.emit(
-                "transcription-partial",
-                serde_json::json!({ "speaker": speaker, "text": "" }),
-            )
-            .ok();
+            // Clear the partial line in the UI — the final (if any) replaced
+            // it — plus the press-timing signals (utterance over). Gated so a
+            // zombie can't wipe its successor's live state.
+            if token.alive() {
+                partials.clear(speaker);
+                if speaker == "interviewer" {
+                    speaking.store(false, Ordering::Relaxed);
+                }
+                app.emit(
+                    "transcription-partial",
+                    serde_json::json!({ "speaker": speaker, "text": "" }),
+                )
+                .ok();
+            }
         } else if !text.is_empty() && text != last_partial && utterance_peak_rms >= rms_gate {
             // The hypothesis grew: speech resumed after the snapshot, so an
             // in-flight speculative decode no longer covers the utterance.
@@ -891,11 +1008,21 @@ async fn streaming_loop<C: Consumer<Item = f32>>(
             if let Some(b) = publish_bleed {
                 b.publish(&text);
             }
-            app.emit(
-                "transcription-partial",
-                serde_json::json!({ "speaker": speaker, "text": text }),
-            )
-            .ok();
+            // UI gray line + the press-timing signals: the live partial slot
+            // (a half-spoken question the agent press can read) and the
+            // "interviewer mid-utterance" flag. Gated so a zombie pipeline
+            // can't poison its successor's state.
+            if token.alive() {
+                partials.set(speaker, &text);
+                if speaker == "interviewer" {
+                    speaking.store(true, Ordering::Relaxed);
+                }
+                app.emit(
+                    "transcription-partial",
+                    serde_json::json!({ "speaker": speaker, "text": text }),
+                )
+                .ok();
+            }
             last_partial = text;
         }
 

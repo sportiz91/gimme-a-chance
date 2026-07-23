@@ -28,7 +28,7 @@ mod tts;
 mod vad;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use tauri::{Emitter, Manager};
@@ -90,6 +90,25 @@ static DHAT_PROFILER: std::sync::OnceLock<std::sync::Mutex<Option<dhat::Profiler
 /// Shared app state across Tauri commands
 pub struct AppState {
     pub is_listening: Arc<Mutex<bool>>,
+    /// Monotonic Listen generation — bumped by every `start_listening` AND
+    /// `stop_listening`. Each capture pipeline carries the generation it was
+    /// born under ([`audio::ListenToken`]); a mismatch marks it a zombie from
+    /// a previous Listen. The shared flag alone can't kill zombies: a restart
+    /// flips it false→true in ~600ms, and a pipeline blocked in a long decode
+    /// misses that window entirely (measured 2026-07-23: three loopback
+    /// pipelines transcribing at once after two language flips).
+    pub listen_generation: Arc<AtomicU64>,
+    /// Live partial hypotheses per speaker (streaming engine). The agent press
+    /// reads the interviewer's entry so a question still being spoken reaches
+    /// the prompt — the transcript itself carries finals only.
+    pub live_partials: audio::LivePartials,
+    /// True while the interviewer's pipeline is inside an utterance (VAD voice
+    /// state / active streaming hypothesis). An agent press with no partial
+    /// text to lean on defers briefly on this — the question is in flight.
+    pub interviewer_speaking: Arc<AtomicBool>,
+    /// Notified each time an interviewer transcript FINAL lands — the wake-up
+    /// for a deferred agent press.
+    pub interviewer_final: Arc<tokio::sync::Notify>,
     /// Agent-mode session: the rolling interview transcript (all sources,
     /// append-only) + the background-refreshed Interview State document.
     pub agent: Arc<agent::AgentSession>,
@@ -142,6 +161,10 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             is_listening: Arc::new(Mutex::new(false)),
+            listen_generation: Arc::new(AtomicU64::new(0)),
+            live_partials: audio::LivePartials::default(),
+            interviewer_speaking: Arc::new(AtomicBool::new(false)),
+            interviewer_final: Arc::new(tokio::sync::Notify::new()),
             agent: Arc::new(agent::AgentSession::default()),
             metrics: Arc::new(metrics::Metrics::default()),
             api: Arc::new(backend::ApiBackend::new()),

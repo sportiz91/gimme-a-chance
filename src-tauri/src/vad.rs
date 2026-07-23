@@ -77,6 +77,14 @@ impl VadChunker {
         }
     }
 
+    /// Is the chunker currently inside an utterance — voice heard, chunk not
+    /// yet flushed? The trailing-silence countdown still counts: those words
+    /// sit in the un-emitted chunk, so their transcription is still in flight.
+    #[must_use]
+    pub fn in_speech(&self) -> bool {
+        !matches!(self.state, State::Idle)
+    }
+
     /// Feed exactly one frame of 16kHz mono f32 samples (`FRAME_SAMPLES` long).
     /// Returns an action: either keep accumulating or emit the finished chunk.
     pub fn push_frame(&mut self, frame_f32: &[f32]) -> ChunkAction {

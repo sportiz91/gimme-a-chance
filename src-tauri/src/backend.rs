@@ -206,11 +206,14 @@ fn agent_system(language: Language) -> &'static str {
     }
 }
 
-/// The volatile tail: Interview State + the press instruction. Rides at the
-/// END of the prompt where attention is strongest; framed as REFERENCE ONLY
-/// with the live transcript winning conflicts (the Hermes lesson — models
-/// otherwise answer questions out of the summary instead of the live moment).
-fn agent_tail(state_block: &str, language: Language) -> String {
+/// The volatile tail: Interview State + the interviewer's in-flight partial
+/// (if any) + the press instruction. Rides at the END of the prompt where
+/// attention is strongest; framed as REFERENCE ONLY with the live transcript
+/// winning conflicts (the Hermes lesson — models otherwise answer questions
+/// out of the summary instead of the live moment). The partial lives HERE and
+/// never in the transcript: it's provisional text a final will supersede, and
+/// the transcript must stay an append-only, byte-stable cache prefix.
+fn agent_tail(state_block: &str, live_partial: Option<&str>, language: Language) -> String {
     let state_section = if state_block.is_empty() {
         String::new()
     } else {
@@ -230,6 +233,23 @@ fn agent_tail(state_block: &str, language: Language) -> String {
             ),
         }
     };
+    let partial_section = live_partial.map_or_else(String::new, |p| match language {
+        Language::English => format!(
+            "=== INTERVIEWER, MID-SENTENCE RIGHT NOW (live partial transcription — may be \
+             garbled and incomplete, a final will supersede it; if a question is forming \
+             here, THAT question is what the user needs help with) ===\n\
+             {p}\n\
+             === END MID-SENTENCE ===\n\n"
+        ),
+        Language::Spanish => format!(
+            "=== EL ENTREVISTADOR ESTÁ DICIENDO ESTO AHORA MISMO (transcripción parcial en \
+             vivo — puede venir con errores o cortada, un final la va a reemplazar; si acá \
+             se está formando una pregunta, ESA pregunta es con lo que el usuario necesita \
+             ayuda) ===\n\
+             {p}\n\
+             === FIN PARCIAL ===\n\n"
+        ),
+    });
     let request = match language {
         Language::English => {
             "HELP REQUEST: the user pressed the help hotkey NOW. Based on the final \
@@ -241,7 +261,7 @@ fn agent_tail(state_block: &str, language: Language) -> String {
              ahora mismo."
         }
     };
-    format!("{state_section}{request}")
+    format!("{state_section}{partial_section}{request}")
 }
 
 // The Interview State maintainer runs on the cheap sibling model in the
@@ -331,6 +351,14 @@ const AGENT_MAX_OUT: u32 = 1200;
 /// Interview State refresh: background call, latency uncritical.
 const STATE_TIMEOUT: Duration = Duration::from_secs(45);
 const STATE_MAX_OUT: u32 = 900;
+/// Reasoning budget for the state refresher, ON TOP of `STATE_MAX_OUT`.
+/// gpt-5.4-mini spends reasoning tokens from the same `max_completion_tokens`
+/// budget BEFORE emitting any content; with the generic 1024 headroom a large
+/// transcript delta ate the whole cap and returned an EMPTY message with
+/// `finish_reason` "length" (HTTP 200) — measured 9× on 2026-07-23, killing
+/// every refresh from minute 36 on. 4096 matches what the ecosystem converged
+/// on for reasoning-mode summarizers.
+const STATE_REASONING_HEADROOM: u32 = 4096;
 
 /// Result of one API answer turn.
 pub struct ApiOutcome {
@@ -554,7 +582,7 @@ pub fn agent_prompt_base_tokens(
 ) -> u64 {
     let system = styled_system(agent_system(language), language, style);
     crate::context_meter::count_tokens(&system)
-        + crate::context_meter::count_tokens(&agent_tail(state_block, language))
+        + crate::context_meter::count_tokens(&agent_tail(state_block, None, language))
 }
 
 /// How answers are WORDED. Selected in the UI. `Normal` keeps the prompts
@@ -806,6 +834,7 @@ impl ApiBackend {
         &self,
         transcript: &str,
         state_block: &str,
+        live_partial: Option<&str>,
         language: Language,
         brain: BrainModel,
         style: ResponseStyle,
@@ -821,7 +850,7 @@ impl ApiBackend {
             model,
             &styled_system(agent_system(language), language, style),
             transcript,
-            &agent_tail(state_block, language),
+            &agent_tail(state_block, live_partial, language),
         );
         // Decoder-level brevity nudge; compounds with the caveman prompt.
         if style == ResponseStyle::Caveman && model.starts_with("gpt-5") {
@@ -875,45 +904,83 @@ impl ApiBackend {
             prev_state
         };
         let user = format!("Previous state document:\n{prev}\n\nNew transcript lines:\n{delta}");
-        let mut body = chat_body(STATE_MODEL, STATE_SYS, json!(user), STATE_MAX_OUT, 0.2);
-        body["stream"] = json!(false);
-        // `stream_options` is only legal on streaming requests.
-        if let Some(o) = body.as_object_mut() {
-            o.remove("stream_options");
+        // Reasoning models pay their thinking from `max_completion_tokens`
+        // BEFORE any visible output: too little headroom returns an EMPTY
+        // message with finish_reason "length" and HTTP 200. Give the refresher
+        // real headroom, and on exactly that signature retry once with double.
+        let mut headroom = STATE_REASONING_HEADROOM;
+        loop {
+            let mut body = chat_body(
+                STATE_MODEL,
+                STATE_SYS,
+                json!(user.clone()),
+                STATE_MAX_OUT,
+                0.2,
+            );
+            body["stream"] = json!(false);
+            // `stream_options` is only legal on streaming requests.
+            if let Some(o) = body.as_object_mut() {
+                o.remove("stream_options");
+            }
+            body["reasoning_effort"] = json!("low");
+            body["max_completion_tokens"] = json!(STATE_MAX_OUT + headroom);
+            let resp = tokio::time::timeout(
+                STATE_TIMEOUT,
+                self.client
+                    .post(OPENAI_URL)
+                    .bearer_auth(key.expose_secret())
+                    .json(&body)
+                    .send(),
+            )
+            .await
+            .map_err(|_| anyhow!("state refresh timed out"))??;
+            let request_id = openai_request_id(&resp);
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let snippet: String = body.chars().take(200).collect();
+                bail!("HTTP {status}: {snippet}");
+            }
+            let v: Value = resp.json().await?;
+            let text = v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let usage = v
+                .get("usage")
+                .map(TokenUsage::from_json)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                return Ok((text, request_id, usage));
+            }
+            let finish_reason = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reasoning_tokens = v
+                .pointer("/usage/completion_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if finish_reason == "length" && headroom == STATE_REASONING_HEADROOM {
+                tracing::warn!(
+                    target: "agent",
+                    finish_reason = %finish_reason,
+                    reasoning_tokens,
+                    headroom,
+                    request_id = request_id.as_deref().unwrap_or("-"),
+                    "state refresh came back empty (reasoning ate the budget) — retrying with doubled headroom"
+                );
+                headroom *= 2;
+                continue;
+            }
+            bail!(
+                "state refresh returned empty content (finish_reason={finish_reason}, \
+                 reasoning_tokens={reasoning_tokens}, headroom={headroom})"
+            );
         }
-        body["reasoning_effort"] = json!("low");
-        let resp = tokio::time::timeout(
-            STATE_TIMEOUT,
-            self.client
-                .post(OPENAI_URL)
-                .bearer_auth(key.expose_secret())
-                .json(&body)
-                .send(),
-        )
-        .await
-        .map_err(|_| anyhow!("state refresh timed out"))??;
-        let request_id = openai_request_id(&resp);
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
-            bail!("HTTP {status}: {snippet}");
-        }
-        let v: Value = resp.json().await?;
-        let text = v
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            bail!("state refresh returned empty content");
-        }
-        let usage = v
-            .get("usage")
-            .map(TokenUsage::from_json)
-            .unwrap_or_default();
-        Ok((text, request_id, usage))
     }
 
     /// Weigh-in ping (the manager's "⚖️ verify + warm" button): send the agent
@@ -941,7 +1008,7 @@ impl ApiBackend {
             model,
             &styled_system(agent_system(language), language, style),
             transcript,
-            &agent_tail(state_block, language),
+            &agent_tail(state_block, None, language),
         );
         body["stream"] = json!(false);
         if let Some(o) = body.as_object_mut() {
@@ -1005,6 +1072,13 @@ fn agent_body(model: &str, system: &str, transcript: &str, tail: &str) -> Value 
         // the debug panel's context/cache meter.
         "stream_options": {"include_usage": true},
     });
+    // Stable per-session cache key: routes consecutive presses (and the ⚖️
+    // warm ping) to the same cache shard, instead of relying on OpenAI's
+    // prefix-hash routing alone — which measured 0/15 hits on 40-59k-token
+    // stable prefixes across two real interviews (2026-07-23).
+    if let Some(sid) = crate::storage::current_session_id() {
+        body["prompt_cache_key"] = json!(format!("gimme-agent-{sid}"));
+    }
     if model.starts_with("gpt-5") {
         body["max_completion_tokens"] = json!(AGENT_MAX_OUT + 2048);
         // Latency over depth: the user is live in an interview. "low" keeps

@@ -5,6 +5,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -46,7 +47,7 @@ pub async fn start_listening(
         *is_listening = true;
     }
 
-    let is_listening = Arc::clone(&state.is_listening);
+    let token = mint_listen_token(&state);
     let metrics = Arc::clone(&state.metrics);
 
     // The language the UI selected (default English). Drives the on-device model
@@ -107,7 +108,7 @@ pub async fn start_listening(
             let (aec_tx, aec_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
             spawn_pipeline(
                 app.clone(),
-                Arc::clone(&is_listening),
+                token.clone(),
                 Arc::clone(&metrics),
                 None,
                 audio::CaptureSource::Loopback,
@@ -120,7 +121,7 @@ pub async fn start_listening(
             );
             spawn_pipeline(
                 app,
-                is_listening,
+                token,
                 metrics,
                 None,
                 audio::CaptureSource::Microphone,
@@ -140,7 +141,7 @@ pub async fn start_listening(
             };
             spawn_pipeline(
                 app,
-                is_listening,
+                token,
                 metrics,
                 device_name,
                 cs,
@@ -297,7 +298,7 @@ fn warm_stt_models(app: tauri::AppHandle, state: &AppState, language: crate::lan
 #[allow(clippy::too_many_arguments)]
 fn spawn_pipeline(
     app: tauri::AppHandle,
-    is_listening: Arc<std::sync::Mutex<bool>>,
+    token: audio::ListenToken,
     metrics: Arc<crate::metrics::Metrics>,
     device_name: Option<String>,
     source: audio::CaptureSource,
@@ -316,7 +317,7 @@ fn spawn_pipeline(
         rt.block_on(async {
             if let Err(e) = audio::capture_and_transcribe(
                 app,
-                is_listening,
+                token,
                 metrics,
                 device_name,
                 source,
@@ -338,11 +339,19 @@ fn spawn_pipeline(
 #[tauri::command]
 #[tracing::instrument(skip(state))]
 pub async fn stop_listening(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
-    let mut is_listening = state
-        .is_listening
-        .lock()
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    *is_listening = false;
+    {
+        let mut is_listening = state
+            .is_listening
+            .lock()
+            .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+        *is_listening = false;
+    }
+    // Invalidate every live pipeline's generation NOW: a pipeline blocked in
+    // a long decode may never observe the brief `false` above when a restart
+    // follows — the stale generation is what actually kills it.
+    state.listen_generation.fetch_add(1, Ordering::SeqCst);
+    state.live_partials.clear_all();
+    state.interviewer_speaking.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -444,6 +453,8 @@ pub async fn ask_agent(
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
+    let (deferred_ms, live_partial) = press_timing(&state).await;
+
     let (transcript, transcript_lines) = state.agent.transcript_text();
     if transcript.is_empty() {
         return Err(AppError::Llm(
@@ -457,13 +468,19 @@ pub async fn ask_agent(
     let state_block = state.agent.state_block();
 
     #[cfg(debug_assertions)]
-    dump_agent_prompt(&trace_id, &transcript, &state_block);
+    dump_agent_prompt(
+        &trace_id,
+        &transcript,
+        &state_block,
+        live_partial.as_deref(),
+    );
 
     let outcome = state
         .api
         .ask_agent(
             &transcript,
             &state_block,
+            live_partial.as_deref(),
             language,
             brain,
             style,
@@ -502,6 +519,8 @@ pub async fn ask_agent(
         transcript_lines,
         transcript_chars = transcript.len(),
         state_chars = state_block.len(),
+        partial_chars = live_partial.as_deref().map_or(0, str::len),
+        deferred_ms,
         prompt_tokens = outcome.usage.prompt,
         cached_tokens = outcome.usage.cached,
         completion_tokens = outcome.usage.completion,
@@ -536,17 +555,85 @@ pub async fn ask_agent(
     Ok(outcome.answer)
 }
 
-/// Debug builds only: persist the exact agent prompt (transcript + state) to
-/// `logs/agent-prompts/`, so "why did it answer THIS?" can be answered offline
-/// against the API with the very same input.
+/// Mint the liveness token for a new Listen: bump the generation (pipelines
+/// from any earlier Listen become zombies whose pushes get discarded — the
+/// shared flag alone can't kill one blocked in a decode across a restart's
+/// brief `false` window) and reset the press-timing signals.
+fn mint_listen_token(state: &tauri::State<'_, AppState>) -> audio::ListenToken {
+    let my_gen = state.listen_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.live_partials.clear_all();
+    state.interviewer_speaking.store(false, Ordering::Relaxed);
+    audio::ListenToken::new(
+        Arc::clone(&state.is_listening),
+        Arc::clone(&state.listen_generation),
+        my_gen,
+    )
+}
+
+/// Press-timing guards (real-interview post-mortem 2026-07-23: presses that
+/// fire before the interviewer's question reaches the transcript answer the
+/// PREVIOUS topic): optionally defer to the in-flight final, then read whatever
+/// partial text exists for the prompt's volatile tail. Returns
+/// `(deferred_ms, live_partial)`.
+async fn press_timing(state: &tauri::State<'_, AppState>) -> (u64, Option<String>) {
+    let deferred_ms = defer_to_question_final(state).await;
+    let live_partial = state
+        .live_partials
+        .fresh("interviewer", PARTIAL_FRESH_FOR_PROMPT);
+    (deferred_ms, live_partial)
+}
+
+/// How fresh an interviewer partial must be to ride in the press prompt.
+/// Older means the endpoint already fired and the final superseded it.
+const PARTIAL_FRESH_FOR_PROMPT: Duration = Duration::from_secs(2);
+/// Cap on how long a press waits for the in-flight question's final.
+const DEFER_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Defer-to-final: when the press lands while the interviewer is mid-utterance
+/// and there's no partial text to hand the model (the chunked engines — Groq /
+/// Parakeet-per-VAD-chunk — have none), the question is still in flight and
+/// answering now means answering the PREVIOUS topic. Wait for the interviewer
+/// final that's about to land, bounded by [`DEFER_TIMEOUT`]. On the streaming
+/// engine the partial short-circuits this, so the press stays instant.
+/// Returns the milliseconds actually waited (0 = no defer).
+async fn defer_to_question_final(state: &tauri::State<'_, AppState>) -> u64 {
+    let listening = state.is_listening.lock().map(|g| *g).unwrap_or(false);
+    if !listening || !state.interviewer_speaking.load(Ordering::Relaxed) {
+        return 0;
+    }
+    if state
+        .live_partials
+        .fresh("interviewer", PARTIAL_FRESH_FOR_PROMPT)
+        .is_some()
+    {
+        return 0;
+    }
+    // Arm the notification BEFORE re-checking, so a final landing in between
+    // wakes us instead of being missed (the timeout bounds the residual race).
+    let notified = state.interviewer_final.notified();
+    if !state.interviewer_speaking.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let t0 = Instant::now();
+    let _ = tokio::time::timeout(DEFER_TIMEOUT, notified).await;
+    u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Debug builds only: persist the exact agent prompt (transcript + state +
+/// in-flight partial) to `logs/agent-prompts/`, so "why did it answer THIS?"
+/// can be answered offline against the API with the very same input.
 #[cfg(debug_assertions)]
-fn dump_agent_prompt(trace_id: &str, transcript: &str, state_block: &str) {
+fn dump_agent_prompt(trace_id: &str, transcript: &str, state_block: &str, partial: Option<&str>) {
     let dir = crate::telemetry::logs_dir().join("agent-prompts");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let path = dir.join(format!("{trace_id}.md"));
-    let content = format!("# transcript\n\n{transcript}\n\n# interview state\n\n{state_block}\n");
+    let partial_section =
+        partial.map_or_else(String::new, |p| format!("\n# live partial\n\n{p}\n"));
+    let content = format!(
+        "# transcript\n\n{transcript}\n\n# interview state\n\n{state_block}\n{partial_section}"
+    );
     if std::fs::write(&path, content).is_ok() {
         tracing::info!(path = %path.display(), "agent prompt dumped (debug build)");
     }
