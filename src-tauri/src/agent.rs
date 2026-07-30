@@ -82,6 +82,15 @@ pub struct AgentSession {
     /// Real, precise counts (unlike `chars_total`): counted at push time by
     /// the same tokenizer family the answering models use.
     line_tokens: AtomicU64,
+    /// The loaded codebase defense pack, if any: the take-home repo's source
+    /// (line-numbered) + rationale docs, built by the defense-pack skill. Set
+    /// once pre-interview from the 📦 select; rides as its OWN message between
+    /// system and transcript, so it joins the byte-stable cached prefix and the
+    /// state refresher (which only iterates `lines`) never sees it.
+    codebase_pack: Mutex<Option<String>>,
+    /// o200k tokens of the loaded pack (0 = none) — context meter component,
+    /// counted once at load time.
+    pack_tokens: AtomicU64,
     /// The Interview State document (markdown). Empty until the first refresh.
     state_block: Mutex<String>,
     /// `lines.len()` at the last successful refresh — the next refresh reads
@@ -101,6 +110,8 @@ impl Default for AgentSession {
             lines: Mutex::new(Vec::new()),
             chars_total: AtomicU64::new(0),
             line_tokens: AtomicU64::new(0),
+            codebase_pack: Mutex::new(None),
+            pack_tokens: AtomicU64::new(0),
             state_block: Mutex::new(String::new()),
             state_covered_lines: AtomicU64::new(0),
             chars_at_refresh: AtomicU64::new(0),
@@ -161,6 +172,31 @@ impl AgentSession {
     /// the context meter's live component (see `context_meter::gauge`).
     pub fn line_tokens_total(&self) -> u64 {
         self.line_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Install (or clear, with `None`) the codebase defense pack. Returns the
+    /// pack's o200k token count. Tokenizing a ~300KB pack costs tens of ms —
+    /// paid once on the command thread at load time, never on an audio path.
+    pub fn set_codebase_pack(&self, text: Option<String>) -> u64 {
+        let toks = text
+            .as_deref()
+            .map_or(0, crate::context_meter::count_tokens);
+        self.pack_tokens.store(toks, Ordering::Relaxed);
+        if let Ok(mut p) = self.codebase_pack.lock() {
+            *p = text;
+        }
+        toks
+    }
+
+    /// The loaded pack's full text, if any (cloned — a ~300KB memcpy per
+    /// press, microseconds).
+    pub fn codebase_pack(&self) -> Option<String> {
+        self.codebase_pack.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// o200k tokens of the loaded pack (0 = none).
+    pub fn pack_tokens_total(&self) -> u64 {
+        self.pack_tokens.load(Ordering::Relaxed)
     }
 
     /// Current Interview State document (empty until the first refresh lands).

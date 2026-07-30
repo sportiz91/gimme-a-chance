@@ -29,6 +29,7 @@ fn label(event: &EventRow) -> &str {
         "question" => "Question",
         "answer" => "Answer",
         "context" => "Loaded context",
+        "pack" => "Codebase pack",
         other => other,
     }
 }

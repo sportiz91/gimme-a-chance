@@ -98,6 +98,28 @@ Frontend communicates with Rust via Tauri IPC (invoke/listen).
 - If a rebuild fails with "Acceso denegado (os error 5)" on the exe, a previous
   instance is still running: `Stop-Process -Name gimme-a-chance -Force`.
 
+## Codebase Defense Pack (📦)
+
+For "defend your take-home" rounds: the whole challenge repo (line-numbered
+source + rationale docs, built by the `defense-pack` Claude Code skill) is
+embedded in the agent's context so answers can cite `file:line` instead of
+improvising over the code.
+
+- Packs live in `Documents\gimme-a-chance\packs\` (sibling of `exports\`).
+  The 📦 select in the main overlay lists them (`list_packs`), and picking one
+  runs `load_codebase_pack` → `AgentSession::codebase_pack`, then auto-fires
+  `warm_agent_context` so the prompt cache is primed before the call starts.
+- The pack rides as its OWN user message BETWEEN system and transcript
+  (`agent_body`), which keeps it inside the byte-stable cached prefix. A unit
+  test pins that ordering — reordering it silently costs full-price input on
+  every press. `snapshot_delta` only iterates transcript lines, so the
+  Interview State refresher never sees the pack.
+- Deliberately NOT persisted in localStorage: a pack belongs to ONE interview,
+  and a stale pack silently steering answers is worse than re-picking it.
+- Never load a pack through the clipboard: that path truncates at
+  `MAX_CLIP_CHARS` (100k chars) and would also inject it into `ask_brain`'s
+  rolling context (Groq).
+
 ## Acoustic Echo Cancellation (`aec.rs`, `dtln.rs`)
 
 In "both" capture the interviewer's audio leaks from the headset earpiece into

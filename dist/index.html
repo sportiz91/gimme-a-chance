@@ -126,6 +126,7 @@
     #visionSelect { flex: 0 0 auto; max-width: 160px; }
     #brainSelect  { flex: 0 0 auto; max-width: 190px; }
     #styleSelect  { flex: 0 0 auto; max-width: 150px; }
+    #packSelect   { flex: 0 0 auto; max-width: 190px; }
     /* Grayed while the partials switch is inert (cloud STT selected) */
     .check-label:has(input:disabled) { opacity: 0.45; }
     #simPreset    { flex: 0 0 auto; max-width: 150px; }
@@ -462,6 +463,9 @@
       <select id="styleSelect" title="Response wording: Normal, or telegraphic caveman-terse (the bold opening line stays speakable)">
         <option value="normal">💬 Normal</option>
         <option value="caveman">🪨 Cavernícola</option>
+      </select>
+      <select id="packSelect" title="Codebase defense pack: embeds the take-home repo (line-numbered source + rationale docs from Documents\gimme-a-chance\packs) into the agent's context, then warms the prompt cache — load it BEFORE the interview starts">
+        <option value="">📦 —</option>
       </select>
       <button id="agentBtn" title="The agent reads the whole interview so far and helps with what's needed right now (Ctrl+Shift+Space). Press again while one streams — answers stack.">🤖 Agent</button>
       <button id="addShotBtn" title="Queue a screenshot — scroll and stack several (Ctrl+Shift+Enter)">📸 Add shot</button>
@@ -846,6 +850,55 @@
           document.getElementById('styleSelect').value = await invoke('get_response_style');
         }
       } catch (e) { console.error('initResponseStyle failed:', e); }
+    }
+
+    // Codebase defense pack (📦): the take-home repo, packed by the
+    // defense-pack skill into Documents\gimme-a-chance\packs\. Deliberately
+    // NOT persisted across launches: a pack belongs to ONE interview, and a
+    // stale pack silently steering answers is worse than re-picking it.
+    async function initPacks() {
+      try {
+        const packs = await invoke('list_packs');
+        const sel = document.getElementById('packSelect');
+        for (const name of packs) {
+          const o = document.createElement('option');
+          o.value = name;
+          o.textContent = `📦 ${name.replace(/-DEFENSE-PACK\.(md|xml|txt)$/i, '')}`;
+          sel.appendChild(o);
+        }
+        log('info', 'packs_listed', { count: packs.length });
+      } catch (e) {
+        log('error', 'packs_list_failed', { error: String(e) });
+      }
+    }
+    async function setPack() {
+      const sel = document.getElementById('packSelect');
+      const name = sel.value;
+      if (!name) {
+        try { await invoke('clear_codebase_pack'); log('info', 'pack_cleared', {}); }
+        catch (e) { console.error('clear_codebase_pack failed:', e); }
+        return;
+      }
+      sel.disabled = true;
+      try {
+        const out = await invoke('load_codebase_pack', { name });
+        log('info', 'pack_loaded', { name, chars: out.chars, est_tokens: out.est_tokens });
+      } catch (e) {
+        log('error', 'pack_load_failed', { name, error: String(e) });
+        sel.value = '';
+        sel.disabled = false;
+        return;
+      }
+      sel.disabled = false;
+      // Auto-warm: pay the uncached prefill NOW, before the call starts, so
+      // the first real press hits a warm cache — and the meter re-anchors to
+      // the server's exact count. Best-effort: a warm failure keeps the pack.
+      try {
+        const warm = await invoke('warm_agent_context');
+        log('info', 'pack_warmed', { prompt_tokens: warm.prompt_tokens, cached_tokens: warm.cached_tokens });
+      } catch (e) {
+        log('error', 'pack_warm_failed', { name, error: String(e) });
+      }
     }
 
     // Screenshot queue: Ctrl+Shift+Enter stacks captures (scroll a long page
@@ -1360,6 +1413,7 @@
       on('visionSelect', 'change', setVisionModel);
       on('brainSelect', 'change', setBrainModel);
       on('styleSelect', 'change', setResponseStyle);
+      on('packSelect', 'change', setPack);
       on('agentBtn', 'click', askAgent);
       on('addShotBtn', 'click', addShot);
       on('describeBtn', 'click', () => describeQueue());
@@ -1395,6 +1449,7 @@
     initVisionModel();
     initBrainModel();
     initResponseStyle();
+    initPacks();
     initQueue();
     initAutoClip();
 

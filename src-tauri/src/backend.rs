@@ -832,6 +832,7 @@ impl ApiBackend {
     #[allow(clippy::too_many_arguments)]
     pub async fn ask_agent(
         &self,
+        codebase_pack: Option<&str>,
         transcript: &str,
         state_block: &str,
         live_partial: Option<&str>,
@@ -849,6 +850,7 @@ impl ApiBackend {
         let mut body = agent_body(
             model,
             &styled_system(agent_system(language), language, style),
+            codebase_pack,
             transcript,
             &agent_tail(state_block, live_partial, language),
         );
@@ -993,6 +995,7 @@ impl ApiBackend {
     /// prompt; the cache warm only survives ~5-10 min of inactivity.
     pub async fn warm_agent(
         &self,
+        codebase_pack: Option<&str>,
         transcript: &str,
         state_block: &str,
         language: Language,
@@ -1007,6 +1010,7 @@ impl ApiBackend {
         let mut body = agent_body(
             model,
             &styled_system(agent_system(language), language, style),
+            codebase_pack,
             transcript,
             &agent_tail(state_block, None, language),
         );
@@ -1053,20 +1057,31 @@ impl ApiBackend {
     }
 }
 
-/// The agent request body. Three messages: [static system] + [transcript] +
-/// [volatile tail]. The ORDER is load-bearing: system+transcript form a
-/// stable, append-only prefix that `OpenAI`'s automatic prompt caching bills at
-/// ~10% from the second press on (and cuts TTFT); only the tiny tail changes
-/// per press. Never insert anything between system and transcript, and never
-/// rewrite old transcript lines — either invalidates the whole cache.
-fn agent_body(model: &str, system: &str, transcript: &str, tail: &str) -> Value {
+/// The agent request body. Messages: [static system] + [codebase pack, when
+/// loaded] + [transcript] + [volatile tail]. The ORDER is load-bearing:
+/// system+pack+transcript form a stable, append-only prefix that `OpenAI`'s
+/// automatic prompt caching bills at ~10% from the second press on (and cuts
+/// TTFT); only the tiny tail changes per press. The pack is set once
+/// pre-interview and byte-stable after that (loading one mid-session
+/// invalidates the cache exactly once). Never insert anything else between
+/// system and transcript, and never rewrite old transcript lines — either
+/// invalidates the whole cache.
+fn agent_body(
+    model: &str,
+    system: &str,
+    codebase_pack: Option<&str>,
+    transcript: &str,
+    tail: &str,
+) -> Value {
+    let mut messages = vec![json!({"role": "system", "content": system})];
+    if let Some(pack) = codebase_pack {
+        messages.push(json!({"role": "user", "content": pack}));
+    }
+    messages.push(json!({"role": "user", "content": transcript}));
+    messages.push(json!({"role": "user", "content": tail}));
     let mut body = json!({
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": transcript},
-            {"role": "user", "content": tail},
-        ],
+        "messages": messages,
         "stream": true,
         // Final pre-[DONE] chunk carries token usage incl. cached_tokens —
         // the debug panel's context/cache meter.
@@ -1289,4 +1304,54 @@ fn build_user(question: &str, context: &str, language: Language) -> String {
 
 fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contents(body: &Value) -> Vec<(String, String)> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap().to_string(),
+                    m["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The message ORDER is what makes prompt caching pay: [system] +
+    /// [codebase pack] + [transcript] must form a byte-stable prefix, with only
+    /// the tail varying per press. A reordering here silently costs full-price
+    /// input on every press (measured: 0% cache hits across two real
+    /// interviews before `prompt_cache_key`), so it's worth pinning.
+    #[test]
+    fn agent_body_puts_pack_between_system_and_transcript() {
+        let with_pack = agent_body("gpt-5.5", "SYS", Some("PACK"), "TRANSCRIPT", "TAIL");
+        assert_eq!(
+            contents(&with_pack),
+            vec![
+                ("system".into(), "SYS".into()),
+                ("user".into(), "PACK".into()),
+                ("user".into(), "TRANSCRIPT".into()),
+                ("user".into(), "TAIL".into()),
+            ]
+        );
+
+        // No pack loaded: byte-identical to the pre-feature 3-message shape,
+        // so existing sessions keep their cached prefixes.
+        let without = agent_body("gpt-5.5", "SYS", None, "TRANSCRIPT", "TAIL");
+        assert_eq!(
+            contents(&without),
+            vec![
+                ("system".into(), "SYS".into()),
+                ("user".into(), "TRANSCRIPT".into()),
+                ("user".into(), "TAIL".into()),
+            ]
+        );
+    }
 }

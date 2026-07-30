@@ -455,16 +455,15 @@ pub async fn ask_agent(
 
     let (deferred_ms, live_partial) = press_timing(&state).await;
 
-    let (transcript, transcript_lines) = state.agent.transcript_text();
-    if transcript.is_empty() {
-        return Err(AppError::Llm(
-            "nothing transcribed yet — the agent has no context to work from".into(),
-        ));
-    }
+    let (codebase_pack, transcript, transcript_lines) = agent_context(
+        &state,
+        "nothing transcribed yet — the agent has no context to work from",
+    )?;
     // Estimator reading at snapshot time — becomes the meter's anchor twin
     // when this press's real usage lands (lines pushed while the request is
     // in flight stay in the pending delta).
     let line_tokens_at_press = state.agent.line_tokens_total();
+    let pack_tokens_at_press = state.agent.pack_tokens_total();
     let state_block = state.agent.state_block();
 
     #[cfg(debug_assertions)]
@@ -478,6 +477,7 @@ pub async fn ask_agent(
     let outcome = state
         .api
         .ask_agent(
+            codebase_pack.as_deref(),
             &transcript,
             &state_block,
             live_partial.as_deref(),
@@ -496,14 +496,9 @@ pub async fn ask_agent(
     // Zero usage means the stream broke before the usage chunk — keep the
     // previous (still valid) anchor instead of zeroing the context meter.
     if outcome.usage.prompt > 0 {
-        m.agent_prompt_tokens
-            .store(outcome.usage.prompt, Ordering::Relaxed);
-        m.agent_cached_tokens
-            .store(outcome.usage.cached, Ordering::Relaxed);
+        m.anchor_agent_context(outcome.usage, line_tokens_at_press, pack_tokens_at_press);
         m.agent_completion_tokens
             .store(outcome.usage.completion, Ordering::Relaxed);
-        m.agent_anchor_line_tokens
-            .store(line_tokens_at_press, Ordering::Relaxed);
     }
     m.add_spend(outcome.usage);
     set_provider(&state, &format!("agent/{}", outcome.model));
@@ -518,6 +513,7 @@ pub async fn ask_agent(
         model = outcome.model,
         transcript_lines,
         transcript_chars = transcript.len(),
+        pack_chars = codebase_pack.as_deref().map_or(0, str::len),
         state_chars = state_block.len(),
         partial_chars = live_partial.as_deref().map_or(0, str::len),
         deferred_ms,
@@ -588,6 +584,30 @@ async fn press_timing(state: &tauri::State<'_, AppState>) -> (u64, Option<String
 const PARTIAL_FRESH_FOR_PROMPT: Duration = Duration::from_secs(2);
 /// Cap on how long a press waits for the in-flight question's final.
 const DEFER_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Transcript message when a codebase pack is loaded but nothing was
+/// transcribed yet (pre-interview press / auto-warm after a pack load).
+const EMPTY_TRANSCRIPT_PLACEHOLDER: &str = "(no transcript yet — the interview has not started)";
+
+/// The context an agent request works from: `(codebase pack, transcript,
+/// transcript line count)`. A loaded pack IS context — with an empty
+/// transcript it stands in via a stable placeholder (never "" — not betting
+/// on the API accepting empty message content). Errors only when neither
+/// exists.
+fn agent_context(
+    state: &tauri::State<'_, AppState>,
+    empty_err: &str,
+) -> Result<(Option<String>, String, usize), AppError> {
+    let pack = state.agent.codebase_pack();
+    let (mut transcript, lines) = state.agent.transcript_text();
+    if transcript.is_empty() {
+        if pack.is_none() {
+            return Err(AppError::Llm(empty_err.into()));
+        }
+        transcript = EMPTY_TRANSCRIPT_PLACEHOLDER.into();
+    }
+    Ok((pack, transcript, lines))
+}
 
 /// Defer-to-final: when the press lands while the interviewer is mid-utterance
 /// and there's no partial text to hand the model (the chunked engines — Groq /
@@ -1543,28 +1563,29 @@ pub async fn warm_agent_context(
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
 
-    let (transcript, _lines) = state.agent.transcript_text();
-    if transcript.is_empty() {
-        return Err(AppError::Llm(
-            "the agent context is empty — nothing to weigh yet".into(),
-        ));
-    }
+    let (codebase_pack, transcript, _lines) =
+        agent_context(&state, "the agent context is empty — nothing to weigh yet")?;
     let line_tokens_at_press = state.agent.line_tokens_total();
+    let pack_tokens_at_press = state.agent.pack_tokens_total();
     let state_block = state.agent.state_block();
 
     let (usage, request_id) = state
         .api
-        .warm_agent(&transcript, &state_block, language, brain, style)
+        .warm_agent(
+            codebase_pack.as_deref(),
+            &transcript,
+            &state_block,
+            language,
+            brain,
+            style,
+        )
         .await
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
     // Same anchor update as a real press (warm_agent guarantees prompt > 0).
     // `agent_completion_tokens` stays — the ping's 1-token answer is noise.
     let m = &state.metrics;
-    m.agent_prompt_tokens.store(usage.prompt, Ordering::Relaxed);
-    m.agent_cached_tokens.store(usage.cached, Ordering::Relaxed);
-    m.agent_anchor_line_tokens
-        .store(line_tokens_at_press, Ordering::Relaxed);
+    m.anchor_agent_context(usage, line_tokens_at_press, pack_tokens_at_press);
     m.add_spend(usage);
 
     tracing::info!(
@@ -1577,4 +1598,94 @@ pub async fn warm_agent_context(
         prompt_tokens: usage.prompt,
         cached_tokens: usage.cached,
     })
+}
+
+/// Where codebase defense packs live: `Documents\gimme-a-chance\packs\`,
+/// sibling of `exports\`. Written by the defense-pack skill (repomix source
+/// with line numbers + rationale docs); Windows-visible so packs load with
+/// WSL down.
+fn packs_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs_next::document_dir()
+        .ok_or_else(|| anyhow::anyhow!("no Documents directory"))?
+        .join("gimme-a-chance")
+        .join("packs"))
+}
+
+/// File names in the packs folder, sorted — the 📦 select's options. A
+/// missing folder is a fresh machine, not an error: empty list.
+#[tauri::command]
+pub fn list_packs() -> Result<Vec<String>, AppError> {
+    let dir = packs_dir().map_err(AppError::Other)?;
+    let dir_display = dir.display().to_string();
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let lower = name.to_lowercase();
+                (entry.file_type().ok()?.is_file()
+                    && [".md", ".xml", ".txt"]
+                        .iter()
+                        .any(|ext| lower.ends_with(ext)))
+                .then_some(name)
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    tracing::info!(dir = %dir_display, count = names.len(), "codebase packs listed");
+    Ok(names)
+}
+
+/// What a pack load reports back: size on disk and what it will weigh inside
+/// the agent prompt.
+#[derive(serde::Serialize)]
+pub struct PackOutcome {
+    pub chars: usize,
+    pub est_tokens: u64,
+}
+
+/// Load a codebase defense pack into the agent prompt as its own message
+/// between system and transcript — part of the byte-stable cached prefix. Set
+/// once pre-interview from the 📦 select; the frontend follows up with a
+/// `warm_agent_context` so the cache is primed before the call starts. The
+/// session log gets a small `pack` marker event (name + sizes), never the
+/// full text — it's a generated artifact, reproducible from the repo.
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub async fn load_codebase_pack(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<PackOutcome, AppError> {
+    // Bare file names only — the select is populated from `list_packs`; a
+    // traversal here would read arbitrary files into the prompt.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(AppError::Other(anyhow::anyhow!("invalid pack name")));
+    }
+    let path = packs_dir().map_err(AppError::Other)?.join(&name);
+    let text = tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path))
+        .await
+        .map_err(|e| AppError::Other(anyhow::anyhow!("read task join: {e}")))?
+        .map_err(|e| AppError::Other(anyhow::anyhow!("reading pack: {e}")))?;
+    let chars = text.len();
+    let est_tokens = state.agent.set_codebase_pack(Some(text));
+    storage::record(storage::Event {
+        kind: "pack",
+        speaker: None,
+        content: name.clone(),
+        t_s: state.agent.elapsed_s(),
+        meta: Some(serde_json::json!({ "chars": chars, "est_tokens": est_tokens })),
+    });
+    tracing::info!(name = %name, chars, est_tokens, "codebase pack loaded");
+    Ok(PackOutcome { chars, est_tokens })
+}
+
+/// Unload the pack (📦 select back to "—"). Invalidates the cached prefix
+/// beyond the system message — acceptable, this is a deliberate pre-interview
+/// action.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn clear_codebase_pack(state: tauri::State<'_, AppState>) {
+    state.agent.set_codebase_pack(None);
+    tracing::info!("codebase pack cleared");
 }

@@ -34,6 +34,9 @@ use crate::AppState;
 /// real `usage` arrives.
 const CHAT_FORMAT_OVERHEAD: u64 = 12;
 
+/// Extra wrapper tokens for the codebase-pack message, when one is loaded.
+const PACK_MESSAGE_OVERHEAD: u64 = 4;
+
 /// `o200k_base` token count of `text`. The singleton builds the BPE ranks on
 /// first use (~100ms) — [`warmup`] pays that at startup, off the hot paths.
 pub fn count_tokens(text: &str) -> u64 {
@@ -74,6 +77,7 @@ pub fn gauge(state: &AppState) -> ContextGauge {
     let brain = state.brain_model.lock().map(|g| *g).unwrap_or_default();
     let window = backend::context_window(brain.agent_model_id());
     let line_tokens = state.agent.line_tokens_total();
+    let pack_tokens = state.agent.pack_tokens_total();
 
     let anchor_prompt = state.metrics.agent_prompt_tokens.load(Ordering::Relaxed);
     if anchor_prompt > 0 {
@@ -81,7 +85,12 @@ pub fn gauge(state: &AppState) -> ContextGauge {
             .metrics
             .agent_anchor_line_tokens
             .load(Ordering::Relaxed);
-        let pending = line_tokens.saturating_sub(anchor_lines);
+        let anchor_pack = state
+            .metrics
+            .agent_anchor_pack_tokens
+            .load(Ordering::Relaxed);
+        let pending =
+            line_tokens.saturating_sub(anchor_lines) + pack_tokens.saturating_sub(anchor_pack);
         return ContextGauge {
             used: anchor_prompt + pending,
             pending,
@@ -98,7 +107,13 @@ pub fn gauge(state: &AppState) -> ContextGauge {
         .unwrap_or(crate::lang::Language::English);
     let style = state.response_style.lock().map(|g| *g).unwrap_or_default();
     let base = backend::agent_prompt_base_tokens(language, style, &state.agent.state_block());
-    let used = base + line_tokens + CHAT_FORMAT_OVERHEAD;
+    let overhead = CHAT_FORMAT_OVERHEAD
+        + if pack_tokens > 0 {
+            PACK_MESSAGE_OVERHEAD
+        } else {
+            0
+        };
+    let used = base + line_tokens + pack_tokens + overhead;
     ContextGauge {
         used,
         pending: used,

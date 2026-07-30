@@ -92,7 +92,8 @@ foreach ($p in $procs) {
 
         $affinity = 0
         $ok = [WinProbe]::GetWindowDisplayAffinity($hwnd, [ref]$affinity)
-        $ex = [uint64][WinProbe]::GetWindowLongPtr($hwnd, $GWL_EXSTYLE)
+        # Via [int64]: PowerShell refuses IntPtr → UInt64 directly.
+        $ex = [uint64][int64][WinProbe]::GetWindowLongPtr($hwnd, $GWL_EXSTYLE)
 
         $flags = @()
         if ($ex -band $WS_EX_NOACTIVATE) { $flags += 'NOACTIVATE' }

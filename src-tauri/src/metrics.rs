@@ -49,6 +49,9 @@ pub struct Metrics {
     // The three `context_*` gauges are refreshed each emitter tick by
     // `context_meter::gauge` (same pattern as the heap counters).
     pub agent_anchor_line_tokens: AtomicU64,
+    /// `AgentSession::pack_tokens_total()` at the last anchor — same role as
+    /// `agent_anchor_line_tokens`, for the codebase pack message.
+    pub agent_anchor_pack_tokens: AtomicU64,
     pub context_used_tokens: AtomicU64,
     pub context_pending_tokens: AtomicU64,
     pub context_window_tokens: AtomicU64,
@@ -89,6 +92,7 @@ impl Default for Metrics {
             agent_cached_tokens: AtomicU64::new(0),
             agent_completion_tokens: AtomicU64::new(0),
             agent_anchor_line_tokens: AtomicU64::new(0),
+            agent_anchor_pack_tokens: AtomicU64::new(0),
             context_used_tokens: AtomicU64::new(0),
             context_pending_tokens: AtomicU64::new(0),
             context_window_tokens: AtomicU64::new(0),
@@ -107,6 +111,26 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Re-anchor the context meter on a server-confirmed prompt size (agent
+    /// press / warm ping), together with the local estimator readings taken
+    /// at that same moment — from here on the live estimate only spans what
+    /// was pushed since.
+    pub fn anchor_agent_context(
+        &self,
+        usage: crate::backend::TokenUsage,
+        line_tokens: u64,
+        pack_tokens: u64,
+    ) {
+        self.agent_prompt_tokens
+            .store(usage.prompt, Ordering::Relaxed);
+        self.agent_cached_tokens
+            .store(usage.cached, Ordering::Relaxed);
+        self.agent_anchor_line_tokens
+            .store(line_tokens, Ordering::Relaxed);
+        self.agent_anchor_pack_tokens
+            .store(pack_tokens, Ordering::Relaxed);
+    }
+
     /// Fold one API call's token usage into the session spend counters.
     pub fn add_spend(&self, usage: crate::backend::TokenUsage) {
         self.total_prompt_tokens
