@@ -119,6 +119,9 @@ pub struct AppState {
     pub vision_model: Arc<Mutex<backend::VisionModel>>,
     /// Brain model that answers (later: a wired-in agent). Toggled from the UI; default Auto.
     pub brain_model: Arc<Mutex<backend::BrainModel>>,
+    /// What the interview is doing right now (normal vs live algorithmic
+    /// exercise 🧮). Toggled from the UI; default Normal.
+    pub answer_mode: Arc<Mutex<backend::AnswerMode>>,
     /// How answers are worded (normal vs caveman-terse). Toggled from the UI; default Normal.
     pub response_style: Arc<Mutex<backend::ResponseStyle>>,
     /// Latest screen description (for the future agent + debug). Overwritten each capture.
@@ -170,6 +173,7 @@ impl Default for AppState {
             api: Arc::new(backend::ApiBackend::new()),
             vision_model: Arc::new(Mutex::new(backend::VisionModel::default())),
             brain_model: Arc::new(Mutex::new(backend::BrainModel::default())),
+            answer_mode: Arc::new(Mutex::new(backend::AnswerMode::default())),
             response_style: Arc::new(Mutex::new(backend::ResponseStyle::default())),
             last_description: Arc::new(Mutex::new(String::new())),
             capture_queue: Arc::new(Mutex::new(Vec::new())),
@@ -479,6 +483,10 @@ pub fn run() {
     // Ctrl+Shift+Space: the agent press — "read everything so far and help me
     // with whatever is needed RIGHT NOW" (no question heuristics involved).
     let agent_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+    // Ctrl+Shift+C: the same agent press with caveman wording forced for THIS
+    // answer only — the panic button when the last answer was a wall of text,
+    // without flipping the sticky 🪨 dropdown.
+    let caveman_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
 
     let app_state = AppState::default();
     let metrics_for_emitter = Arc::clone(&app_state.metrics);
@@ -583,9 +591,16 @@ pub fn run() {
                     } else if shortcut == &clip_shortcut {
                         tracing::debug!("clipboard-ingest shortcut pressed");
                         _ = app.emit("trigger-clipboard-ingest", ());
-                    } else if shortcut == &agent_shortcut {
-                        tracing::debug!("agent-query shortcut pressed");
-                        _ = app.emit("trigger-agent-query", ());
+                    } else if shortcut == &agent_shortcut || shortcut == &caveman_shortcut {
+                        let one_shot_caveman = shortcut == &caveman_shortcut;
+                        tracing::debug!(one_shot_caveman, "agent-query shortcut pressed");
+                        // Payload = per-press style override; null means "use
+                        // the sticky dropdown" (the frontend passes it through
+                        // to `ask_agent` untouched).
+                        _ = app.emit(
+                            "trigger-agent-query",
+                            one_shot_caveman.then_some("caveman"),
+                        );
                         // When the app is parked off-screen the press still runs —
                         // the hidden main webview drives `ask_agent` and mirrors the
                         // answer — but nothing is on screen to read it. Bring the
@@ -715,6 +730,7 @@ pub fn run() {
                 ("Ctrl+Shift+1", describe_shortcut),
                 ("Ctrl+Shift+V", clip_shortcut),
                 ("Ctrl+Shift+Space", agent_shortcut),
+                ("Ctrl+Shift+C", caveman_shortcut),
             ] {
                 if let Err(e) = app.global_shortcut().register(sc) {
                     tracing::warn!(shortcut = label, error = %e, "shortcut registration failed (held by another app?)");
@@ -728,6 +744,7 @@ pub fn run() {
                 describe_queue = "Ctrl+Shift+1",
                 clipboard_ingest = "Ctrl+Shift+V",
                 agent_query = "Ctrl+Shift+Space",
+                agent_caveman_one_shot = "Ctrl+Shift+C",
                 "global shortcuts registered"
             );
 
@@ -848,6 +865,8 @@ pub fn run() {
             commands::get_brain_model,
             commands::set_response_style,
             commands::get_response_style,
+            commands::set_answer_mode,
+            commands::get_answer_mode,
             commands::set_language,
             commands::get_language,
             commands::set_stt_config,

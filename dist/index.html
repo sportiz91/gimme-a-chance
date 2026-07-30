@@ -126,6 +126,13 @@
     #visionSelect { flex: 0 0 auto; max-width: 160px; }
     #brainSelect  { flex: 0 0 auto; max-width: 190px; }
     #styleSelect  { flex: 0 0 auto; max-width: 150px; }
+    #modeSelect   { flex: 0 0 auto; max-width: 130px; }
+    /* Loud while the 🧮 exercise contract rides every answer — the standing
+       reminder to flip back to Normal when the exercise ends. */
+    #modeSelect.algo-on {
+      background: rgba(255, 167, 38, 0.35);
+      border-color: rgba(255, 167, 38, 0.8);
+    }
     #packSelect   { flex: 0 0 auto; max-width: 190px; }
     /* Grayed while the partials switch is inert (cloud STT selected) */
     .check-label:has(input:disabled) { opacity: 0.45; }
@@ -459,6 +466,10 @@
         <option value="auto">🧠 Auto (Groq→OpenAI)</option>
         <option value="gpt_4o_mini">🧠 gpt-4o-mini</option>
         <option value="gpt_5_5">🧠 gpt-5.5</option>
+      </select>
+      <select id="modeSelect" title="What the interview is doing right now: Normal, or a live algorithmic exercise — 🧮 asserts the exercise contract (simplest optimal solution, insight-first, delta-only follow-ups). Flip it ON when the interviewer announces the exercise, OFF when it ends.">
+        <option value="normal">🧠 Normal</option>
+        <option value="algo">🧮 Algo</option>
       </select>
       <select id="styleSelect" title="Response wording: Normal, or telegraphic caveman-terse (the bold opening line stays speakable)">
         <option value="normal">💬 Normal</option>
@@ -852,6 +863,27 @@
       } catch (e) { console.error('initResponseStyle failed:', e); }
     }
 
+    // Answer mode (🧮): Normal vs live algorithmic exercise. Deliberately NOT
+    // persisted across launches — an exercise belongs to one interview moment,
+    // and a stale 🧮 from last session silently reshaping every answer is
+    // exactly the failure the amber styling exists to prevent.
+    function paintModeSelect() {
+      const sel = document.getElementById('modeSelect');
+      sel.classList.toggle('algo-on', sel.value === 'algo');
+    }
+    async function setAnswerMode() {
+      const mode = document.getElementById('modeSelect').value;
+      paintModeSelect();
+      try { await invoke('set_answer_mode', { mode }); log('info', 'answer_mode_set', { mode }); }
+      catch (e) { console.error('set_answer_mode failed:', e); }
+    }
+    async function initAnswerMode() {
+      try {
+        document.getElementById('modeSelect').value = await invoke('get_answer_mode');
+        paintModeSelect();
+      } catch (e) { console.error('initAnswerMode failed:', e); }
+    }
+
     // Codebase defense pack (📦): the take-home repo, packed by the
     // defense-pack skill into Documents\gimme-a-chance\packs\. Deliberately
     // NOT persisted across launches: a pack belongs to ONE interview, and a
@@ -1156,15 +1188,15 @@
     // Agent press (Ctrl+Shift+Space): NO question extraction — the backend sends
     // the FULL rolling transcript + Interview State and the model infers what
     // help is needed. Streams into a fresh card at the top of the Answer stack.
-    async function askAgent() {
+    async function askAgent(styleOverride) {
       const t0 = performance.now();
       const trace_id = crypto.randomUUID();
       agentInFlight += 1;
       paintAgentBtn();
       beginAnswer(trace_id, { kind: 'agent', ts: Date.now() });
-      log('info', 'agent_press', { trace_id, in_flight: agentInFlight });
+      log('info', 'agent_press', { trace_id, in_flight: agentInFlight, style_override: styleOverride ?? null });
       try {
-        const answer = await invoke('ask_agent', { traceId: trace_id });
+        const answer = await invoke('ask_agent', { traceId: trace_id, styleOverride: styleOverride ?? null });
         finishAnswer(trace_id, answer);
         log('info', 'agent_complete', {
           trace_id,
@@ -1219,7 +1251,11 @@
     listen('trigger-queue-capture', () => addShot());
     listen('trigger-describe-queue', () => describeQueue());
     listen('trigger-clipboard-ingest', () => ingestClipboard());
-    listen('trigger-agent-query', () => askAgent());
+    // Payload: per-press style override ("caveman" from Ctrl+Shift+C), or
+    // null for the plain agent press.
+    listen('trigger-agent-query', (event) => {
+      askAgent(typeof event.payload === 'string' ? event.payload : undefined);
+    });
 
     // Listen for transcription events from backend. Each line is labeled with its
     // speaker: 'interviewer' (loopback / system audio) or 'me' (mic).
@@ -1374,6 +1410,7 @@
     // shortcut definitions in lib.rs.
     const SHORTCUTS = [
       { keys: ['Ctrl', 'Shift', 'Space'], desc: '<b>Agent</b> — reads the whole interview so far and helps with what\'s needed right now. Press again while one streams: the answers stack, newest first' },
+      { keys: ['Ctrl', 'Shift', 'C'], desc: '<b>Agent, caveman one-shot</b> — same press, but THIS answer comes back telegraphic. The panic button when the last answer was a wall of text; the 🪨 dropdown stays untouched' },
       { keys: ['Ctrl', 'Shift', 'Enter'], desc: '<b>Add shot</b> — queue a screenshot; scroll and stack several' },
       { keys: ['Ctrl', 'Shift', '1'], desc: '<b>Describe</b> — send queued shots in one pass, or capture+describe now if none queued' },
       { keys: ['Ctrl', 'Shift', 'V'], desc: '<b>Clip</b> — copy the current selection and ingest it as context' },
@@ -1412,9 +1449,10 @@
       on('listenBtn', 'click', toggleListening);
       on('visionSelect', 'change', setVisionModel);
       on('brainSelect', 'change', setBrainModel);
+      on('modeSelect', 'change', setAnswerMode);
       on('styleSelect', 'change', setResponseStyle);
       on('packSelect', 'change', setPack);
-      on('agentBtn', 'click', askAgent);
+      on('agentBtn', 'click', () => askAgent());
       on('addShotBtn', 'click', addShot);
       on('describeBtn', 'click', () => describeQueue());
       on('clearQueueBtn', 'click', clearQueue);
@@ -1449,6 +1487,7 @@
     initVisionModel();
     initBrainModel();
     initResponseStyle();
+    initAnswerMode();
     initPacks();
     initQueue();
     initAutoClip();

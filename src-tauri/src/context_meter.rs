@@ -105,8 +105,9 @@ pub fn gauge(state: &AppState) -> ContextGauge {
         .lock()
         .map(|g| *g)
         .unwrap_or(crate::lang::Language::English);
+    let mode = state.answer_mode.lock().map(|g| *g).unwrap_or_default();
     let style = state.response_style.lock().map(|g| *g).unwrap_or_default();
-    let base = backend::agent_prompt_base_tokens(language, style, &state.agent.state_block());
+    let base = backend::agent_prompt_base_tokens(language, mode, style, &state.agent.state_block());
     let overhead = CHAT_FORMAT_OVERHEAD
         + if pack_tokens > 0 {
             PACK_MESSAGE_OVERHEAD

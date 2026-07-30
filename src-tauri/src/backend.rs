@@ -101,17 +101,91 @@ fn caveman_suffix(language: Language) -> &'static str {
     }
 }
 
-/// `base` with the selected style applied: `Normal` borrows the prompt
-/// unchanged, `Caveman` appends the terseness addendum.
+// ── Algo mode ───────────────────────────────────────────────────────────────
+//
+// Assertive exercise contract appended when the UI's 🧮 mode is on. Manual
+// select over auto-detection on purpose: an asserted "the interview is NOW in
+// an algorithmic exercise" beats a conditional "if this is an algorithm
+// question..." (conditioned format rules dilute and misroute at the edges),
+// the Normal path stays byte-identical, and an exercise always announces
+// itself with minutes of setup slack to click the select (Pluxee R2 2026-07-28:
+// two minutes between "I'll paste an algorithm" and the statement). Composed
+// from the field's tightest prompts (OpenCluely dsa.md minimal-optimal rules,
+// Natively's delta-only follow-up discipline) + that interview's post-mortem:
+// the answer that hurt used three data structures and reprinted the full
+// function on every follow-up, when one map and a one-line delta were the
+// right moves — and the model DEFENDED the extra structure through six
+// Socratic nudges instead of restructuring it away.
+const ALGO_EN: &str = "\n\
+ALGORITHM EXERCISE MODE — the interview is NOW in a live algorithmic exercise (LeetCode-style, \
+spoken or in a scratch editor). These rules override the general format:\n\
+- Best reachable TIME complexity first; among those, the fewest data structures and \
+variables. A notably simpler solution one class slower (e.g. sort + two pointers vs a hash \
+map) gets ONE mention as fallback, never the lead. If a structure exists only to patch a \
+case (dedup, ordering, one edge), restructure the algorithm so the need disappears — never \
+patch. First check: does counting frequencies or iterating unique values reach the same \
+complexity with fewer structures? Prefer that shape.\n\
+- The bold line = the core insight + complexity, speakable (\"Complement lookup in a set, one \
+pass — O(n) time, O(n) space\"). Never code in the bold line.\n\
+- Then a 3-step reasoning path to SAY: brute force in one sentence with its cost → the \
+insight → the optimal. They grade the reasoning, not the artifact.\n\
+- Pseudocode without types or boilerplate, ~10 lines max. Close with 1 line: key edge case + \
+the most likely follow-up.\n\
+- Follow-up about the solution already given → the DELTA only, 1-3 lines, NEVER reprint \
+unchanged code. If the interviewer hints at a simplification (\"do you really need it?\"), \
+that is a cue: adopt it and restructure — don't defend your version.\n\
+- If the problem statement arrived garbled or indirect, open with one line — \"❓ They're \
+asking: <the question, plainly>\" — before the bold line.";
+const ALGO_ES: &str = "\n\
+MODO EJERCICIO ALGORÍTMICO — la entrevista está AHORA en un ejercicio de algoritmos en vivo \
+(tipo LeetCode, hablado o en un editor borrador). Estas reglas pisan el formato general:\n\
+- Primero la mejor complejidad TEMPORAL alcanzable; entre esas, mínimas estructuras de datos \
+y variables. Una solución notablemente más simple pero una clase más lenta (ej. sort + two \
+pointers vs hash map) va en UNA línea como alternativa, nunca como respuesta principal. Si \
+una estructura existe solo para parchear un caso (dedup, orden, un borde), reestructurá el \
+algoritmo para que la necesidad desaparezca — nunca parchees. Chequeá primero: ¿contar \
+frecuencias o iterar valores únicos llega a la misma complejidad con menos estructuras? \
+Preferí esa forma.\n\
+- La negrita = el insight central + la complejidad, decible (\"Busco el complemento en un set, \
+una pasada — O(n) tiempo, O(n) espacio\"). Nunca código en la negrita.\n\
+- Después, el camino razonado en 3 pasos PARA DECIR: fuerza bruta en una oración con su costo \
+→ el insight → el óptimo. Evalúan el razonamiento, no el artefacto.\n\
+- Pseudocódigo sin tipos ni boilerplate, ~10 líneas máximo. Cerrá con 1 línea: edge case \
+clave + la repregunta más probable.\n\
+- Repregunta sobre la solución ya dada → SOLO el delta, 1-3 líneas, NUNCA reimprimas código \
+sin cambios. Si el entrevistador insinúa una simplificación (\"¿lo necesitás de verdad?\"), es \
+una pista: adoptala y reestructurá — no defiendas tu versión.\n\
+- Si el enunciado llegó confuso o indirecto, abrí con una línea — \"❓ Te preguntan: <la \
+pregunta en claro>\" — antes de la negrita.";
+
+fn algo_suffix(language: Language) -> &'static str {
+    match language {
+        Language::English => ALGO_EN,
+        Language::Spanish => ALGO_ES,
+    }
+}
+
+/// `base` with the selected mode and style applied: `Normal`+`Normal` borrows
+/// the prompt unchanged; `Algo` appends the exercise contract; `Caveman`
+/// appends the terseness addendum last — it's about wording, whatever the
+/// mode.
 fn styled_system(
     base: &'static str,
     language: Language,
+    mode: AnswerMode,
     style: ResponseStyle,
 ) -> Cow<'static, str> {
-    match style {
-        ResponseStyle::Normal => Cow::Borrowed(base),
-        ResponseStyle::Caveman => Cow::Owned(format!("{base}{}", caveman_suffix(language))),
+    if mode == AnswerMode::Normal && style == ResponseStyle::Normal {
+        return Cow::Borrowed(base);
     }
+    let mut s = String::from(base);
+    if mode == AnswerMode::Algo {
+        s.push_str(algo_suffix(language));
+    }
+    if style == ResponseStyle::Caveman {
+        s.push_str(caveman_suffix(language));
+    }
+    Cow::Owned(s)
 }
 
 // The vision model transcribes/describes the screen as text; it must NOT solve
@@ -577,12 +651,43 @@ pub fn context_window(model: &str) -> u64 {
 #[must_use]
 pub fn agent_prompt_base_tokens(
     language: Language,
+    mode: AnswerMode,
     style: ResponseStyle,
     state_block: &str,
 ) -> u64 {
-    let system = styled_system(agent_system(language), language, style);
+    let system = styled_system(agent_system(language), language, mode, style);
     crate::context_meter::count_tokens(&system)
         + crate::context_meter::count_tokens(&agent_tail(state_block, None, language))
+}
+
+/// WHAT the interview is doing right now. Selected in the UI (🧮). `Normal`
+/// keeps the prompts exactly as they always were; `Algo` asserts a live
+/// algorithmic exercise and appends the exercise contract to both answer
+/// system prompts. Orthogonal to [`ResponseStyle`] (what) × (wording).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnswerMode {
+    #[default]
+    Normal,
+    Algo,
+}
+
+impl AnswerMode {
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Algo => "algo",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "normal" => Some(Self::Normal),
+            "algo" => Some(Self::Algo),
+            _ => None,
+        }
+    }
 }
 
 /// How answers are WORDED. Selected in the UI. `Normal` keeps the prompts
@@ -671,12 +776,13 @@ impl ApiBackend {
         context: &str,
         language: Language,
         brain: BrainModel,
+        mode: AnswerMode,
         style: ResponseStyle,
         trace_id: &str,
         app: &AppHandle,
     ) -> Result<ApiOutcome> {
         let prompt = build_user(question, context, language);
-        let system = styled_system(system_prompt(language), language, style);
+        let system = styled_system(system_prompt(language), language, mode, style);
         let mut last_err = anyhow!("no providers available (no API keys?)");
         for p in brain.providers() {
             let Some(key) = self.key_for(p.key_env) else {
@@ -838,6 +944,7 @@ impl ApiBackend {
         live_partial: Option<&str>,
         language: Language,
         brain: BrainModel,
+        mode: AnswerMode,
         style: ResponseStyle,
         trace_id: &str,
         app: &AppHandle,
@@ -849,7 +956,7 @@ impl ApiBackend {
         let model = brain.agent_model_id();
         let mut body = agent_body(
             model,
-            &styled_system(agent_system(language), language, style),
+            &styled_system(agent_system(language), language, mode, style),
             codebase_pack,
             transcript,
             &agent_tail(state_block, live_partial, language),
@@ -993,6 +1100,7 @@ impl ApiBackend {
     /// `OpenAI`'s prompt cache so the first real press starts from a warm
     /// prefix — lower TTFT, cached input rate. Costs one uncached read of the
     /// prompt; the cache warm only survives ~5-10 min of inactivity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn warm_agent(
         &self,
         codebase_pack: Option<&str>,
@@ -1000,6 +1108,7 @@ impl ApiBackend {
         state_block: &str,
         language: Language,
         brain: BrainModel,
+        mode: AnswerMode,
         style: ResponseStyle,
     ) -> Result<(TokenUsage, Option<String>)> {
         let key = self
@@ -1009,7 +1118,7 @@ impl ApiBackend {
         let model = brain.agent_model_id();
         let mut body = agent_body(
             model,
-            &styled_system(agent_system(language), language, style),
+            &styled_system(agent_system(language), language, mode, style),
             codebase_pack,
             transcript,
             &agent_tail(state_block, None, language),
@@ -1353,5 +1462,33 @@ mod tests {
                 ("user".into(), "TAIL".into()),
             ]
         );
+    }
+
+    /// Normal+Normal must borrow the base untouched (the byte-stable cached
+    /// prefix — and the guarantee that turning 🧮 OFF restores the exact
+    /// pre-feature prompt); with both addenda on, the algo contract lands
+    /// before the caveman wording suffix.
+    #[test]
+    fn styled_system_layers_algo_before_caveman() {
+        let base = system_prompt(Language::English);
+        let plain = styled_system(
+            base,
+            Language::English,
+            AnswerMode::Normal,
+            ResponseStyle::Normal,
+        );
+        assert!(matches!(plain, Cow::Borrowed(_)));
+        assert_eq!(plain, base);
+
+        let both = styled_system(
+            base,
+            Language::English,
+            AnswerMode::Algo,
+            ResponseStyle::Caveman,
+        );
+        let algo_at = both.find("ALGORITHM EXERCISE MODE").expect("algo block");
+        let caveman_at = both.find("CAVEMAN MODE").expect("caveman block");
+        assert!(both.starts_with(base));
+        assert!(algo_at < caveman_at);
     }
 }

@@ -392,6 +392,11 @@ pub async fn ask_brain(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let mode = state
+        .answer_mode
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     let style = state
         .response_style
         .lock()
@@ -400,7 +405,9 @@ pub async fn ask_brain(
 
     let outcome = state
         .api
-        .ask(&question, &context, language, brain, style, &trace_id, &app)
+        .ask(
+            &question, &context, language, brain, mode, style, &trace_id, &app,
+        )
         .await
         .map_err(|e| AppError::Llm(e.to_string()))?;
     metrics
@@ -435,23 +442,13 @@ pub async fn ask_agent(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     trace_id: Option<String>,
+    style_override: Option<String>,
 ) -> Result<String, AppError> {
     let trace_id = trace_id.unwrap_or_else(|| "-".into());
-    let language = state
-        .language
-        .lock()
-        .map(|g| *g)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    let brain = state
-        .brain_model
-        .lock()
-        .map(|g| *g)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
-    let style = state
-        .response_style
-        .lock()
-        .map(|g| *g)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let language = ui_setting(&state.language)?;
+    let brain = ui_setting(&state.brain_model)?;
+    let mode = ui_setting(&state.answer_mode)?;
+    let style = press_style(&state, style_override.as_deref())?;
 
     let (deferred_ms, live_partial) = press_timing(&state).await;
 
@@ -483,6 +480,7 @@ pub async fn ask_agent(
             live_partial.as_deref(),
             language,
             brain,
+            mode,
             style,
             &trace_id,
             &app,
@@ -511,6 +509,8 @@ pub async fn ask_agent(
         target: "agent",
         trace_id = %trace_id,
         model = outcome.model,
+        mode = mode.tag(),
+        style = style.tag(),
         transcript_lines,
         transcript_chars = transcript.len(),
         pack_chars = codebase_pack.as_deref().map_or(0, str::len),
@@ -536,6 +536,8 @@ pub async fn ask_agent(
             "trace_id": trace_id,
             "trigger": "agent",
             "model": outcome.model,
+            "mode": mode.tag(),
+            "style": style.tag(),
             "prompt_tokens": outcome.usage.prompt,
             "cached_tokens": outcome.usage.cached,
             "completion_tokens": outcome.usage.completion,
@@ -549,6 +551,27 @@ pub async fn ask_agent(
     // — never blocking the answer (which already streamed).
     crate::agent::refresh_if_stale(&app);
     Ok(outcome.answer)
+}
+
+/// Copy a UI-toggled setting (language, brain, mode, style) out of its mutex,
+/// mapping a poisoned lock to a command error.
+fn ui_setting<T: Copy>(m: &std::sync::Mutex<T>) -> Result<T, AppError> {
+    m.lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))
+}
+
+/// The wording for THIS press: the per-press override (Ctrl+Shift+C = one
+/// caveman-terse answer) wins over the sticky 🪨 dropdown; an unknown tag
+/// falls back to the dropdown rather than failing a live press.
+fn press_style(
+    state: &tauri::State<'_, AppState>,
+    style_override: Option<&str>,
+) -> Result<crate::backend::ResponseStyle, AppError> {
+    match style_override.and_then(crate::backend::ResponseStyle::from_tag) {
+        Some(s) => Ok(s),
+        None => ui_setting(&state.response_style),
+    }
 }
 
 /// Mint the liveness token for a new Listen: bump the generation (pipelines
@@ -1069,6 +1092,33 @@ pub fn get_response_style(state: tauri::State<'_, AppState>) -> Result<String, A
     Ok(s.tag().to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub fn set_answer_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<(), AppError> {
+    let new_mode = crate::backend::AnswerMode::from_tag(&mode)
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("unknown answer mode: {mode}")))?;
+    let mut guard = state
+        .answer_mode
+        .lock()
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    *guard = new_mode;
+    tracing::info!(?new_mode, "answer mode switched");
+    Ok(())
+}
+
+/// Current answer mode tag (for the UI to reflect on load).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn get_answer_mode(state: tauri::State<'_, AppState>) -> Result<String, AppError> {
+    let m = state
+        .answer_mode
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(m.tag().to_string())
+}
+
 /// Copy the current selection (synthetic Ctrl+C to the focused app) and ingest
 /// the resulting clipboard text (Ctrl+Shift+V, the manual path). The watcher is
 /// suppressed for the duration so the copy isn't ingested twice; no dedup —
@@ -1557,6 +1607,11 @@ pub async fn warm_agent_context(
         .lock()
         .map(|g| *g)
         .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    let mode = state
+        .answer_mode
+        .lock()
+        .map(|g| *g)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     let style = state
         .response_style
         .lock()
@@ -1577,6 +1632,7 @@ pub async fn warm_agent_context(
             &state_block,
             language,
             brain,
+            mode,
             style,
         )
         .await
