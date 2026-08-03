@@ -239,6 +239,22 @@ pub async fn open_answer_window(app: tauri::AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Confirmed quit from the Ctrl+Shift+Q modal. Closes the main window — never
+/// `app.exit()`, whose `std::process::exit()` skips the local destructors the
+/// graceful shutdown relies on (dhat profiler, session log drain).
+#[allow(clippy::unused_async)]
+#[tauri::command]
+#[tracing::instrument(skip(app))]
+pub async fn quit_app(app: tauri::AppHandle) -> Result<(), AppError> {
+    use tauri::Manager;
+    let w = app
+        .get_webview_window("main")
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("main window missing")))?;
+    tracing::info!("quit confirmed, closing main window");
+    w.close().map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
 /// Payload for the `stt-warmup` event, so the UI can show "warming models"
 /// while heavy on-device models load in the background.
 #[derive(Clone, Serialize)]

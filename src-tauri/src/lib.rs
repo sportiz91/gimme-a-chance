@@ -467,9 +467,10 @@ pub fn run() {
     // Ctrl+Shift+H toggles the overlay's visibility (same binding as screen-peek).
     let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyH);
     let debug_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyD);
-    // Graceful quit: Tauri's run loop returns cleanly, letting local guards like
-    // the dhat profiler drop properly and write their output. Killing via Ctrl+C
-    // in the terminal would skip destructors.
+    // Quit request: opens the frontend's confirm modal; the actual close (the
+    // graceful path that lets local guards like the dhat profiler drop and
+    // write their output) only happens when the modal's Confirm invokes
+    // `commands::quit_app`.
     let quit_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyQ);
     // Screenshot queue (same bindings as screen-peek): Ctrl+Shift+Enter queues a
     // capture of the current screen; Ctrl+Shift+1 describes the whole queue in
@@ -572,16 +573,21 @@ pub fn run() {
                         tracing::debug!("debug panel toggle");
                         _ = app.emit("toggle-debug-panel", ());
                     } else if shortcut == &quit_shortcut {
-                        // Close the main window, which causes Tauri's run loop to
-                        // return Ok(()) normally. `app.exit()` would call
-                        // `std::process::exit()` which SKIPS local destructors,
-                        // so the dhat profiler would never write its JSON.
+                        // Never quit outright: a stray press mid-interview must
+                        // not kill the copilot. The frontend shows a
+                        // Confirm/Cancel modal and calls `quit_app` only on
+                        // Confirm; a second press toggles the modal closed, so
+                        // a double-press can't quit either. Reveal main first —
+                        // the modal is unanswerable while the window is parked
+                        // off-screen (content-protected, so a screen share
+                        // never sees it).
+                        tracing::info!("quit shortcut pressed, asking for confirmation");
                         if let Some(window) = app.get_webview_window("main") {
-                            tracing::info!("quit shortcut pressed, closing main window");
-                            if let Err(e) = window.close() {
-                                tracing::error!(error = %e, "failed to close window");
+                            if !is_onscreen(&window) {
+                                reveal_onscreen(&window);
                             }
                         }
+                        _ = app.emit("trigger-quit-confirm", ());
                     } else if shortcut == &queue_shortcut {
                         tracing::debug!("queue-capture shortcut pressed");
                         _ = app.emit("trigger-queue-capture", ());
@@ -874,6 +880,7 @@ pub fn run() {
             commands::log_from_frontend,
             commands::open_answer_window,
             commands::open_manager_window,
+            commands::quit_app,
             commands::list_sessions,
             commands::get_session_events,
             commands::update_session_meta,

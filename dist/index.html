@@ -404,6 +404,58 @@
       font-size: 11px;
       opacity: 0.6;
     }
+
+    /* Quit confirmation — Ctrl+Shift+Q opens this instead of quitting. The
+       full-window backdrop swallows clicks, so a panic click can't land on
+       the toolbar underneath. */
+    .quit-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+    }
+    .quit-backdrop.visible { display: flex; }
+    .quit-modal {
+      width: min(460px, calc(100vw - 32px));
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      padding: 16px;
+      background: rgba(20, 20, 20, 0.97);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 8px;
+    }
+    .quit-modal .q-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .quit-modal .q-sub {
+      font-size: 12px;
+      opacity: 0.75;
+      margin-bottom: 12px;
+    }
+    .quit-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    /* Stay = the safe, prominent choice (green, like `button.active`);
+       quitting is the muted red one. */
+    .quit-actions .stay {
+      background: rgba(76, 175, 80, 0.3);
+      border-color: rgba(76, 175, 80, 0.5);
+    }
+    .quit-actions .quit {
+      background: rgba(239, 83, 80, 0.12);
+      border-color: rgba(239, 83, 80, 0.4);
+      color: #ef9a9a;
+    }
   </style>
   <link rel="stylesheet" href="highlight-github-dark.min.css" />
   <link rel="stylesheet" href="answer-stack.css" />
@@ -542,6 +594,19 @@
       Shortcuts are global — they work while another app has focus. If one
       doesn't respond, another app holds the same binding; the toolbar
       buttons always work.
+    </div>
+  </div>
+
+  <div class="quit-backdrop" id="quitBackdrop">
+    <div class="quit-modal">
+      <div class="q-title">¿Seguro que querés salir?</div>
+      <div class="q-sub">Se cierra el overlay y termina la sesión. Si buscabas
+        otra cosa, probablemente era uno de estos:</div>
+      <div id="quitShortcutsList"></div>
+      <div class="quit-actions">
+        <button class="quit" id="quitConfirmBtn">Salir</button>
+        <button class="stay" id="quitCancelBtn">Seguir acá</button>
+      </div>
     </div>
   </div>
 
@@ -1416,14 +1481,15 @@
       { keys: ['Ctrl', 'Shift', 'V'], desc: '<b>Clip</b> — copy the current selection and ingest it as context' },
       { keys: ['Ctrl', 'Shift', 'H'], desc: '<b>Hide / show</b> the overlay' },
       { keys: ['Ctrl', 'Shift', 'D'], desc: '<b>Debug</b> — toggle the metrics panel' },
-      { keys: ['Ctrl', 'Shift', 'Q'], desc: '<b>Quit</b> the app' },
+      { keys: ['Ctrl', 'Shift', 'Q'], desc: '<b>Quit</b> — opens a confirm modal first; Esc, click outside or a second press cancel' },
     ];
     const shortcutsPanel = document.getElementById('shortcutsPanel');
-    document.getElementById('shortcutsList').innerHTML = SHORTCUTS.map((s) => `
+    const shortcutRows = (list) => list.map((s) => `
       <div class="shortcut-row">
         <span class="keys">${s.keys.map((k) => `<kbd>${k}</kbd>`).join('')}</span>
         <span class="desc">${s.desc}</span>
       </div>`).join('');
+    document.getElementById('shortcutsList').innerHTML = shortcutRows(SHORTCUTS);
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') shortcutsPanel.classList.remove('visible');
     });
@@ -1433,6 +1499,20 @@
       if (!shortcutsPanel.classList.contains('visible')) return;
       if (e.target.closest('#shortcutsBtn')) return;
       shortcutsPanel.classList.remove('visible');
+    });
+
+    // ── Quit confirmation ───────────────────────────────────────────────────
+    // Ctrl+Shift+Q emits trigger-quit-confirm instead of quitting: a stray
+    // press mid-interview must never kill the copilot. The modal reminds what
+    // the other shortcuts do (the quit row is dropped — that key is the one
+    // that opened it). A second press toggles the modal closed, so holding or
+    // double-pressing the key can't quit either; only the Salir button does.
+    const quitBackdrop = document.getElementById('quitBackdrop');
+    document.getElementById('quitShortcutsList').innerHTML =
+      shortcutRows(SHORTCUTS.filter((s) => s.keys.at(-1) !== 'Q'));
+    listen('trigger-quit-confirm', () => quitBackdrop.classList.toggle('visible'));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') quitBackdrop.classList.remove('visible');
     });
 
     // All UI handlers live here, NOT as inline on* attributes: the packaged
@@ -1468,6 +1548,13 @@
         invoke('open_manager_window').catch((e) => log('error', 'open_manager_window_failed', { error: String(e) }));
       });
       on('shortcutsBtn', 'click', () => shortcutsPanel.classList.toggle('visible'));
+      on('quitConfirmBtn', 'click', () => {
+        invoke('quit_app').catch((e) => log('error', 'quit_app_failed', { error: String(e) }));
+      });
+      on('quitCancelBtn', 'click', () => quitBackdrop.classList.remove('visible'));
+      on('quitBackdrop', 'click', (e) => {
+        if (e.target === quitBackdrop) quitBackdrop.classList.remove('visible');
+      });
       on('askBtn', 'click', () => askBrain());
       on('askInput', 'keydown', (e) => { if (e.key === 'Enter') askBrain(); });
       on('simBtn', 'click', simulateInterviewer);
